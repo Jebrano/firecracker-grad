@@ -1,0 +1,41 @@
+# Architecture
+BR2_x86_64=y
+BR2_x86_corei7=y
+
+# Toolchain
+BR2_TOOLCHAIN_BUILDROOT_UCLIBC=y
+BR2_KERNEL_HEADERS_6_1=y
+
+# System
+BR2_TARGET_GENERIC_HOSTNAME="fc-bench"
+BR2_TARGET_GENERIC_ISSUE="Firecracker Benchmark Guest"
+BR2_SYSTEM_DHCP="eth0"
+
+# Init system - keep it BusyBox, no systemd
+BR2_INIT_BUSYBOX=y
+
+# Root filesystem type - ext4, which Firecracker expects
+BR2_TARGET_ROOTFS_EXT2=y
+BR2_TARGET_ROOTFS_EXT2_4=y
+BR2_TARGET_ROOTFS_EXT2_SIZE="512M"
+
+# Packages - only what you need for benchmarking
+BR2_PACKAGE_BUSYBOX=y
+BR2_PACKAGE_FIO=y
+BR2_PACKAGE_IPERF3=y
+BR2_PACKAGE_HTOP=y
+BR2_PACKAGE_STRACE=y
+
+# Allow root login without password (this is a benchmark VM, not production)
+BR2_TARGET_GENERIC_ROOT_PASSWD=""
+
+
+# Overlay
+BR2_ROOTFS_OVERLAY="board/firecracker-bench/rootfs_overlay"
+
+# DHCP network setup, here we will leave empty so no automatic DHCP requests will take place
+# but still for some reason it was looking for "eth0" so we will use an Overlay.
+BR2_SYSTEM_DHCP
+
+# We add libaio for fio jobs
+BR2_PACKAGE_LIBAIO=y
