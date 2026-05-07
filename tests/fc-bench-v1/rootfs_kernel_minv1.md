@@ -14,7 +14,7 @@ sudo apt install -y \
     libssl-dev \
     bc \
     cpio \
-    rsync \dnf
+    rsync \
     python3 \
     file \
     bison \

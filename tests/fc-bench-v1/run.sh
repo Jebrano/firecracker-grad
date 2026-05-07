@@ -1,5 +1,6 @@
 #!/bin/sh
 # V3
+# this script will run the fio job on /vdb and write results to the mounted root disk
 
 MODE=$1
 TEST_DISK=/dev/vdb

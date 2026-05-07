@@ -1,13 +1,15 @@
 #!/bin/bash
+# this is also to start the VM, we use it instead of S99benchmark.
+
 
 BENCHMARK_MODE=${1:-rand_read}
-FC_BINARY=/mydata/fc-bench/firecracker
-KERNEL=/mydata/fc-bench/vmlinux-5.10.245
-ROOTFS=/mydata/fc-bench/rootfs-baseline.ext4
-BENCH_DISK=/mydata/fc-bench/bench-disk.raw
+FC_BINARY=~/fc-bench/firecracker
+KERNEL=~/fc-bench/vmlinux-5.10.245
+ROOTFS=~/fc-bench/rootfs-baseline.ext4
+BENCH_DISK=~/fc-bench/bench-disk.raw
 API_SOCKET=/tmp/fc-bench.socket
-SERIAL_OUT=/mydata/fc-bench/serial-output.txt
-RESULTS=/mydata/fc-bench/results.json
+SERIAL_OUT=~/fc-bench/serial-output.txt
+RESULTS=~/fc-bench/results.json
 TIMEOUT=120  # seconds before giving up
 
 # Clean up leftovers
@@ -16,7 +18,7 @@ rm -f $API_SOCKET $SERIAL_OUT
 # Start Firecracker, serial goes to file
 $FC_BINARY \
     --api-sock $API_SOCKET \
-    --log-path /mydata/fc-bench/fc.log \
+    --log-path ~/fc-bench/fc.log \
     --level Info \
     > $SERIAL_OUT 2>&1 &
 
