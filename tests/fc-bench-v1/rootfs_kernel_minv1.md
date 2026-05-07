@@ -14,7 +14,7 @@ sudo apt install -y \
     libssl-dev \
     bc \
     cpio \
-    rsync \
+    rsync \dnf
     python3 \
     file \
     bison \
@@ -84,6 +84,8 @@ and we create a small blank disk image for results, this is the `/dev/vdb` our s
 dd if=/dev/zero of=~/fc-bench/results.ext4 bs=1M count=64
 mkfs.ext4 ~/fc-bench/results.ext4
 ```
+### *remember we add more space down*
+
 ## Get a guest kernel
 we need a kernel that firecracker can boot, we will buildone and keep in mind we will reconfig it to support landlock.
 we can get the recommended config from firecracker own's repo

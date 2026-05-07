@@ -1,32 +1,4 @@
 #!/bin/sh
-# This runs automatically after the guest boots.
-# Set BENCHMARK_MODE in the kernel cmdline to activate it.
-
-CMDLINE=$(cat /proc/cmdline)
-
-case "$1" in
-    start)
-        # Check if we were told to auto-run a benchmark
-        for param in $CMDLINE; do
-            case "$param" in
-                benchmark=*)
-                    MODE="${param#benchmark=}"
-                    echo "Auto-running benchmark: $MODE"
-                    /root/benchmarks/run.sh "$MODE" > /dev/console 2>&1
-                    # Write a completion marker to the results disk
-                    echo "DONE" >> /dev/vdb
-                    # Power off so the host knows we're finished
-                    poweroff
-                    ;;
-            esac
-        done
-        ;;
-    stop)
-        ;;
-esac
-
-## asd asd asd
-#!/bin/sh
 
 CMDLINE=$(cat /proc/cmdline)
 
@@ -43,6 +15,7 @@ case "$1" in
                     cat /root/results.json      > /dev/ttyS0
                     echo "===RESULTS_END==="    > /dev/ttyS0
                     poweroff
+                    # echo "DONE" >> /dev/vdb;; this was before, make sure we dont need /dev/vdb here???
                     ;;
             esac
         done

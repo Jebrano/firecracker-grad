@@ -1,18 +1,18 @@
 {
   "boot-source": {
-    "kernel_image_path": "/mydata/fc-bench/vmlinux-5.10.245",
+    "kernel_image_path": "/users/Jubranoo/fc-bench/vmlinux-5.10.245",
     "boot_args": "console=ttyS0 reboot=k panic=1 pci=off benchmark=rand_read"
   },
   "drives": [
     {
       "drive_id": "rootfs",
-      "path_on_host": "/mydata/fc-bench/rootfs-baseline.ext4",
+      "path_on_host": "/users/Jubranoo/fc-bench/rootfs-baseline.ext4",
       "is_root_device": true,
       "is_read_only": false
     },
     {
       "drive_id": "benchdisk",
-      "path_on_host": "/mydata/fc-bench/bench-disk.raw",
+      "path_on_host": "/users/Jubranoo/fc-bench/bench-disk.raw",
       "is_root_device": false,
       "is_read_only": false
     }
