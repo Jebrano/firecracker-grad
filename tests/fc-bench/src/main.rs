@@ -65,7 +65,7 @@ struct Config {
 
 impl Config {
     fn new(landlock: bool) -> Self {
-        let base = Path::new("/mydata/fc-bench");
+        let base = Path::new("/users/Jubranoo/fc-bench");
         Self {
             fc_binary:  base.join(if landlock {
                 "firecracker-landlock"
