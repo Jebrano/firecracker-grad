@@ -1,5 +1,5 @@
-cat > board/firecracker-bench/rootfs_overlay/root/benchmarks/run.sh << 'EOF'
 #!/bin/sh
+# cat > board/firecracker-bench/rootfs_overlay/root/benchmarks/run.sh << 'EOF'
 
 MODE=$1
 RESULTS_DISK=/dev/vdb

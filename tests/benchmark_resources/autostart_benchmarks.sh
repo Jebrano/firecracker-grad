@@ -9,11 +9,10 @@ case "$1" in
             case "$param" in
                 benchmark=*)
                     MODE="${param#benchmark=}"
-                    /root/benchmarks/run.sh "$MODE"
+                    echo "===RESULTS_START==="  > /dev/ttyS0
+                    /root/benchmarks/fio.sh "$MODE"
                     # Print results to serial with clear delimiters
                     # so the host harness can parse them out
-                    echo "===RESULTS_START==="  > /dev/ttyS0
-                    cat /root/results.json      > /dev/ttyS0
                     echo "===RESULTS_END==="    > /dev/ttyS0
                     poweroff
                     ;;

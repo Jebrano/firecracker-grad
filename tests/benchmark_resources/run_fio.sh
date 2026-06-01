@@ -1,23 +1,25 @@
 #!/bin/sh
-# V3
+# V4
 # this script will run the fio job on /vdb and write results to the mounted root disk
 
 MODE=$1
 TEST_DISK=/dev/vdb
-RESULTS_FILE=/root/results.json
+ITERS=${2:-30}
+FORMAT=${3:-json}
 
 # Detect libaio
 if fio --enghelp libaio > /dev/null 2>&1; then
     ENGINE="libaio"
     IODEPTH=32
 else
-    echo '{"warning":"libaio not available, using sync"}' > $RESULTS_FILE
+    echo '{"warning":"libaio not available, using sync"}' > /dev/ttyS0
     ENGINE="sync"
     IODEPTH=1
 fi
 
-echo "Running benchmark: $MODE with engine: $ENGINE" > /dev/console
+echo "Running benchmark: $MODE with engine: $ENGINE" > /dev/ttyS0
 
+# fio section
 case "$MODE" in
 
     rand_read)
@@ -29,8 +31,11 @@ case "$MODE" in
             --direct=1 \
             --size=512M \
             --filename=$TEST_DISK \
-            --output-format=json \
-            --output=$RESULTS_FILE
+            --loop="$ITERS" \
+            --output-format="$FORMAT" \
+            --time_based \
+            --runtime=10 \
+            2>/dev/null > /dev/ttyS0
         ;;
 
     seq_write)
@@ -42,8 +47,11 @@ case "$MODE" in
             --direct=1 \
             --size=512M \
             --filename=$TEST_DISK \
-            --output-format=json \
-            --output=$RESULTS_FILE
+            --output-format="$FORMAT" \
+            --loop="$ITERS" \
+            --time_based \
+            --runtime=10 \
+            2>/dev/null > /dev/ttyS0
         ;;
 
     rand_write)
@@ -55,8 +63,11 @@ case "$MODE" in
             --direct=1 \
             --size=512M \
             --filename=$TEST_DISK \
-            --output-format=json \
-            --output=$RESULTS_FILE
+            --output-format="$FORMAT" \
+            --loop="$ITERS" \
+            --time_based \
+            --runtime=10 \
+            2>/dev/null > /dev/ttyS0
         ;;
 
     mixed)
@@ -69,13 +80,15 @@ case "$MODE" in
             --direct=1 \
             --size=512M \
             --filename=$TEST_DISK \
-            --output-format=json \
-            --output=$RESULTS_FILE
+            --output-format="$FORMAT" \
+            --loop="$ITERS" \
+            --time_based \
+            --runtime=10 \
+            2>/dev/null > /dev/ttyS0
         ;;
-
     *)
-        echo '{"error":"unknown benchmark mode"}' > $RESULTS_FILE
+        echo '{"error":"unknown benchmark mode"}' > /dev/ttyS0
         ;;
 esac
 
-echo "Benchmark complete" > /dev/console
+echo "===ALL_DONE===" > /dev/ttyS0
