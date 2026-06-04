@@ -1,6 +1,6 @@
 mod fc_client;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
 use fc_client::FcClient;
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,7 @@ struct Args {
     #[arg(long, default_value = "1")]
     iterations: u32,
 
-    #[arg(long, default_value = "/mydata/fc-bench/results.json")]
+    #[arg(long, default_value = "/users/Jubranoo/fc-bench/results.json")]
     output: PathBuf,
 
     /// Run with Landlock-enabled binary instead of baseline
@@ -32,7 +32,7 @@ struct Args {
     landlock: bool,
 
     /// Path to the kernel image
-    #[arg(long, default_value = "/mydata/fc-bench/vmlinux-5.10.245")]
+    #[arg(long, default_value = "/users/Jubranoo/fc-bench/vmlinux-5.10.245")]
     kernel: PathBuf,
 }
 
@@ -197,6 +197,8 @@ async fn run_one(
 
         // Poll for completion marker
         wait_for_results(&cfg.serial_out, Duration::from_secs(120)).await?;
+        // give the kernel page cache a moment to flush buffered writes
+        sleep(Duration::from_millis(200)).await;
 
         let elapsed = t_start.elapsed().as_secs_f64();
 
@@ -239,7 +241,7 @@ async fn run_one_noi(
 
         // Configure the VM
         let boot_args = format!(
-            "console=ttyS0 reboot=k panic=1 pci=off benchmark={}",
+            "console=ttyS0 reboot=k panic=1 pci=off benchmark={}", // Might be missing the iterations
             mode.as_str()
         );
         client.set_boot_source(
@@ -266,6 +268,8 @@ async fn run_one_noi(
 
         // Poll for completion marker
         wait_for_results(&cfg.serial_out, Duration::from_secs(120)).await?;
+        // give the kernel page cache a moment to flush buffered writes
+        sleep(Duration::from_millis(200)).await;
 
         let elapsed = t_start.elapsed().as_secs_f64();
 
@@ -371,12 +375,30 @@ fn extract_results(serial_path: &Path) -> Result<Value> {
     let start = content
         .find("===RESULTS_START===")
         .ok_or_else(|| anyhow!("RESULTS_START marker not found"))?;
+    // use rfind to pick the *last* END marker (previous runs may leave stale ones)
     let end = content
-        .find("===RESULTS_END===")
+        .rfind("===RESULTS_END===")
         .ok_or_else(|| anyhow!("RESULTS_END marker not found"))?;
 
     let json_str = content[start + "===RESULTS_START===".len()..end].trim();
-    Ok(serde_json::from_str(json_str)?)
+    if json_str.is_empty() {
+        // kernel page cache may not have flushed the fio JSON yet —
+        // wait a beat and re-read
+        std::thread::sleep(Duration::from_millis(500));
+        let content2 = fs::read_to_string(serial_path)?;
+        let start2 = content2
+            .find("===RESULTS_START===")
+            .ok_or_else(|| anyhow!("RESULTS_START marker not found on retry"))?;
+        let end2 = content2
+            .rfind("===RESULTS_END===")
+            .ok_or_else(|| anyhow!("RESULTS_END marker not found on retry"))?;
+        let json_str2 = content2[start2 + "===RESULTS_START===".len()..end2].trim();
+        serde_json::from_str(json_str2)
+            .with_context(|| format!("Failed to parse JSON between markers on retry. Content: '{}'", json_str2))
+    } else {
+        serde_json::from_str(json_str)
+            .with_context(|| format!("Failed to parse JSON between markers. Content: '{}'", json_str))
+    }
 }
 
 // ── Summary ───────────────────────────────────────────────────────
