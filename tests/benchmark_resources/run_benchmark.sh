@@ -1,5 +1,5 @@
 #!/bin/bash
-# this is also to start the VM, we use it instead of S99benchmark.
+# this is also to start the VM.
 
 
 BENCHMARK_MODE=${1:-rand_read}

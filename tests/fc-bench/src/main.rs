@@ -28,8 +28,12 @@ struct Args {
     output: PathBuf,
 
     /// Run with Landlock-enabled binary instead of baseline
-    #[arg(long, required = true)]
+    #[arg(long)]
     landlock: bool,
+
+    /// Path to the kernel image
+    #[arg(long, default_value = "/mydata/fc-bench/vmlinux-5.10.245")]
+    kernel: PathBuf,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -64,7 +68,7 @@ struct Config {
 }
 
 impl Config {
-    fn new(landlock: bool) -> Self {
+    fn new(landlock: bool, kernel: PathBuf) -> Self {
         let base = Path::new("/users/Jubranoo/fc-bench");
         Self {
             fc_binary:  base.join(if landlock {
@@ -72,7 +76,7 @@ impl Config {
             } else {
                 "firecracker"
             }),
-            kernel:     base.join("vmlinux-5.10.245"),
+            kernel,
             rootfs:     base.join("rootfs-baseline.ext4"),
             bench_disk: base.join("bench-disk.raw"),
             socket:     PathBuf::from("/tmp/fc-bench.socket"),
@@ -107,7 +111,7 @@ struct BenchResultNoi {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let cfg = Config::new(args.landlock);
+    let cfg = Config::new(args.landlock, args.kernel);
 
     println!(
         "Running {} x {} | Landlock: {}",
