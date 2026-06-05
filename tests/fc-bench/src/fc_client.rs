@@ -132,20 +132,6 @@ impl FcClient {
         .await
     }
 
-    // ── Network ──────────────────────────────────────────────────
-
-    pub async fn _add_network_interface(
-        &self,
-        iface_id: &str,
-        host_dev: &str,
-    ) -> Result<()> {
-        self.put(&format!("/network-interfaces/{}", iface_id), &serde_json::json!({
-            "iface_id":      iface_id,
-            "host_dev_name": host_dev
-        }))
-        .await
-    }
-
     // ── Actions ──────────────────────────────────────────────────
 
     pub async fn start_instance(&self) -> Result<()> {
@@ -157,11 +143,11 @@ impl FcClient {
 
     // ── Info ─────────────────────────────────────────────────────
 
-    pub async fn _instance_info(&self) -> Result<Value> {
+    pub async fn instance_info(&self) -> Result<Value> {
         self.get("/").await
     }
 
-    pub async fn _machine_config(&self) -> Result<Value> {
+    pub async fn machine_config(&self) -> Result<Value> {
         self.get("/machine-config").await
     }
 }
@@ -187,11 +173,10 @@ mod tests {
             .add_drive("benchdisk", "/path/to/bench.raw", false, false)
             .await?;
         client.set_machine_config(2, 512).await?;
-        client._add_network_interface("eth0", "tap0").await?;
         client.start_instance().await?;
 
-        let _ = client._instance_info().await?;
-        let _ = client._machine_config().await?;
+        let _ = client.instance_info().await?;
+        let _ = client.machine_config().await?;
 
         Ok(())
     }

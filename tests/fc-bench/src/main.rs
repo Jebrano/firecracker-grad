@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command},
     time::{Duration, Instant},
 };
 use tokio::time::sleep;
@@ -90,20 +90,13 @@ impl Config {
 // With Iteration
 #[derive(Debug, Serialize, Deserialize)]
 struct BenchResult {
-    mode:        String,
-    landlock:    bool,
-    iteration:   u32,
-    total_time_s: f64,
-    fio:         Value,
-}
-
-//No Iteration
-#[derive(Debug, Serialize, Deserialize)]
-struct BenchResultNoi {
-    mode:        String,
-    landlock:    bool,
-    total_time_s: f64,
-    fio:         Value,
+    mode:           String,
+    landlock:       bool,
+    iteration:      u32,
+    total_time_s:   f64,
+    fio:            Value,
+    instance_info:  Value,
+    machine_config: Value,
 }
 
 // ── Main ──────────────────────────────────────────────────────────
@@ -120,20 +113,9 @@ async fn main() -> Result<()> {
         args.landlock
     );
 
-    let mut all_results: Vec<BenchResultNoi> = Vec::new();
-    // This must be changed because we are using fio's buyild in iterations. use this for sysbench
-    //
-    // for i in 1..=args.iterations {
-    //     println!("\n--- Iteration {}/{} ---", i, args.iterations);
-    //     let result = run_one(&cfg, &args.mode, i, args.landlock).await?;
-    //     println!("  Completed in {:.2}s", result.total_time_s);
-    //     all_results.push(result);
+    let mut all_results: Vec<BenchResult> = Vec::new();
 
-    //     // Let the system settle between iterations
-    //     sleep(Duration::from_secs(2)).await;
-    // }
-
-    let result = run_one_noi(&cfg, &args.mode, args.landlock).await?;
+    let result = run_one(&cfg, &args.mode, args.iterations, args.landlock).await?;
     println!(" Completed in {:.2}s", result.total_time_s);
 
     all_results.push(result);
@@ -141,7 +123,6 @@ async fn main() -> Result<()> {
     let json = serde_json::to_string_pretty(&all_results)?;
     fs::write(&args.output, &json)?;
     println!("\nResults saved to {}", args.output.display());
-
     print_summary(&all_results);
 
     Ok(())
@@ -191,6 +172,10 @@ async fn run_one(
         ).await?;
         client.set_machine_config(1, 512).await?;
 
+
+        let instance_info = client.instance_info().await?;
+        let machine_config = client.machine_config().await?;
+
         // Boot and time it
         let t_start = Instant::now();
         client.start_instance().await?;
@@ -198,10 +183,9 @@ async fn run_one(
         // Poll for completion marker
         wait_for_results(&cfg.serial_out, Duration::from_secs(120)).await?;
         // give the kernel page cache a moment to flush buffered writes
-        sleep(Duration::from_millis(200)).await;
-
         let elapsed = t_start.elapsed().as_secs_f64();
 
+        sleep(Duration::from_millis(200)).await;
         // Extract JSON from serial output
         let fio_json = extract_results(&cfg.serial_out)?;
 
@@ -211,8 +195,12 @@ async fn run_one(
             iteration,
             total_time_s: elapsed,
             fio:          fio_json,
+            instance_info,
+            machine_config,
         })
     }.await;
+
+
 
     // Always kill Firecracker regardless of success or failure
     let _ = fc.kill();
@@ -220,77 +208,7 @@ async fn run_one(
 
     result
 }
-// This one will use fio's buildin loop.
-async fn run_one_noi(
-    cfg: &Config,
-    mode: &BenchMode,
-    landlock: bool,
-) -> Result<BenchResultNoi> {
 
-    // Clean up leftovers from previous run
-    let _ = fs::remove_file(&cfg.socket);
-    let _ = fs::remove_file(&cfg.serial_out);
-
-    // Start Firecracker
-    let mut fc = start_firecracker(cfg)?;
-
-    let result = async {
-        wait_for_socket(&cfg.socket, Duration::from_secs(5)).await?;
-
-        let client = FcClient::new(cfg.socket.to_str().unwrap());
-
-        // Configure the VM
-        let boot_args = format!(
-            "console=ttyS0 reboot=k panic=1 pci=off benchmark={}", // Might be missing the iterations
-            mode.as_str()
-        );
-        client.set_boot_source(
-            cfg.kernel.to_str().unwrap(),
-            &boot_args
-        ).await?;
-        client.add_drive(
-            "rootfs",
-            cfg.rootfs.to_str().unwrap(),
-            true,
-            false
-        ).await?;
-        client.add_drive(
-            "benchdisk",
-            cfg.bench_disk.to_str().unwrap(),
-            false,
-            false
-        ).await?;
-        client.set_machine_config(1, 512).await?;
-
-        // Boot and time it
-        let t_start = Instant::now();
-        client.start_instance().await?;
-
-        // Poll for completion marker
-        wait_for_results(&cfg.serial_out, Duration::from_secs(120)).await?;
-        // give the kernel page cache a moment to flush buffered writes
-        sleep(Duration::from_millis(200)).await;
-
-        let elapsed = t_start.elapsed().as_secs_f64();
-
-        // Extract JSON from serial output
-        let fio_json = extract_results(&cfg.serial_out)?;
-
-        Ok::<BenchResultNoi, anyhow::Error>(BenchResultNoi {
-            mode:         mode.as_str().to_string(),
-            landlock,
-            total_time_s: elapsed,
-            fio:          fio_json,
-        })
-    }.await;
-
-    // Always kill Firecracker regardless of success or failure
-    let _ = fc.kill();
-    let _ = fc.wait();
-
-    result
-}
-// ── Parsing All Iterations ────────────────────────────────────────
 
 // ── Process management ────────────────────────────────────────────
 
@@ -381,43 +299,27 @@ fn extract_json_block(raw: &str) -> Option<&str> {
 fn extract_results(serial_path: &Path) -> Result<Value> {
     let content = fs::read_to_string(serial_path)?;
 
-    let start = content
-        .find("===RESULTS_START===")
-        .ok_or_else(|| anyhow!("RESULTS_START marker not found"))?;
-    // use rfind to pick the *last* END marker (previous runs may leave stale ones)
-    let end = content
-        .rfind("===RESULTS_END===")
-        .ok_or_else(|| anyhow!("RESULTS_END marker not found"))?;
 
-    let json_str = content[start + "===RESULTS_START===".len()..end].trim();
+    let json_str = content.trim();
     let json_str = extract_json_block(json_str)
         .ok_or_else(|| anyhow!("No JSON object found between markers"))?;
-    if json_str.is_empty() {
-        // kernel page cache may not have flushed the fio JSON yet —
-        // wait a beat and re-read
-        std::thread::sleep(Duration::from_millis(500));
-        let content2 = fs::read_to_string(serial_path)?;
-        let start2 = content2
-            .find("===RESULTS_START===")
-            .ok_or_else(|| anyhow!("RESULTS_START marker not found on retry"))?;
-        let end2 = content2
-            .rfind("===RESULTS_END===")
-            .ok_or_else(|| anyhow!("RESULTS_END marker not found on retry"))?;
-        let json_str2 = content2[start2 + "===RESULTS_START===".len()..end2].trim();
-        let json_str2 = extract_json_block(json_str2)
-            .unwrap_or(json_str2);
-        serde_json::from_str(json_str2)
-            .with_context(|| format!("Failed to parse JSON between markers on retry. Content: '{}'", json_str2))
-    } else {
-        serde_json::from_str(json_str)
-            .with_context(|| format!("Failed to parse JSON between markers. Content: '{}'", json_str))
-    }
+
+
+    serde_json::from_str(json_str)
+        .with_context(|| format!("Failed to parse JSON between markers. Content: '{}'", json_str))
 }
 
 // ── Summary ───────────────────────────────────────────────────────
-// Also changed this type to BenchResultNoi
-fn print_summary(results: &[BenchResultNoi]) {
+fn print_summary(results: &[BenchResult]) {
     if results.is_empty() { return; }
+
+    // Print API-verified configuration from the first run (same for all)
+    if let Some(first) = results.first() {
+        println!("\n=== Firecracker Instance Info ===");
+        println!("{}", serde_json::to_string_pretty(&first.instance_info).unwrap_or_default());
+        println!("\n=== Firecracker Machine Config ===");
+        println!("{}", serde_json::to_string_pretty(&first.machine_config).unwrap_or_default());
+    }
 
     let times: Vec<f64> = results.iter().map(|r| r.total_time_s).collect();
     let mean = times.iter().sum::<f64>() / times.len() as f64;
@@ -444,8 +346,6 @@ mod tests {
 
     #[test]
     fn extracts_json_with_prefix_and_suffix_lines() {
-        // Simulates the actual serial output where status messages
-        // and ===ALL_DONE=== appear between the RESULTS markers.
         let raw = r#"Running benchmark: mixed with engine: libaio
 {
   "fio version" : "fio-3.41",

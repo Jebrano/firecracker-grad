@@ -20,7 +20,6 @@ case "$MODE" in
             --rw=randread \
             --bs=4k \
             --direct=1 \
-            --size=512M \
             --filename=$TEST_DISK \
             --loop="$ITERS" \
             --output-format="$FORMAT" \
@@ -36,7 +35,6 @@ case "$MODE" in
             --rw=write \
             --bs=128k \
             --direct=1 \
-            --size=512M \
             --filename=$TEST_DISK \
             --output-format="$FORMAT" \
             --loop="$ITERS" \
@@ -52,7 +50,6 @@ case "$MODE" in
             --rw=randwrite \
             --bs=4k \
             --direct=1 \
-            --size=512M \
             --filename=$TEST_DISK \
             --output-format="$FORMAT" \
             --loop="$ITERS" \
@@ -69,7 +66,6 @@ case "$MODE" in
             --rwmixread=70 \
             --bs=4k \
             --direct=1 \
-            --size=512M \
             --filename=$TEST_DISK \
             --output-format="$FORMAT" \
             --loop="$ITERS" \
