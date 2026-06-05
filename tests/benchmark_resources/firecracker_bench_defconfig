@@ -39,3 +39,6 @@ BR2_SYSTEM_DHCP
 
 # We add libaio for fio jobs
 BR2_PACKAGE_LIBAIO=y
+
+# Disable getty
+BR2_TARGET_GENERIC_GETTY_PORT=""

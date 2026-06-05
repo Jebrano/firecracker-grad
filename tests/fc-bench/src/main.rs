@@ -21,7 +21,7 @@ struct Args {
     #[arg(long, value_enum, default_value = "rand-read")]
     mode: BenchMode,
 
-    #[arg(long, default_value = "1")]
+    #[arg(long, default_value = "30")]
     iterations: u32,
 
     #[arg(long, default_value = "/users/Jubranoo/fc-bench/results.json")]
@@ -32,7 +32,7 @@ struct Args {
     landlock: bool,
 
     /// Path to the kernel image
-    #[arg(long, default_value = "/users/Jubranoo/fc-bench/vmlinux-5.10.245")]
+    #[arg(long)]
     kernel: PathBuf,
 }
 
@@ -327,7 +327,7 @@ async fn wait_for_socket(path: &Path, timeout: Duration) -> Result<()> {
 
 async fn wait_for_results(serial_path: &Path, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
-    let mut last_print = Instant::now();
+    // let mut last_print = Instant::now();
 
     while Instant::now() < deadline {
         if results_ready(serial_path) {
@@ -335,16 +335,16 @@ async fn wait_for_results(serial_path: &Path, timeout: Duration) -> Result<()> {
         }
 
         // Print progress every 10 seconds
-        if last_print.elapsed() >= Duration::from_secs(10) {
-            let elapsed = deadline - Instant::now();
-            let last_line = last_serial_line(serial_path);
-            println!(
-                "  {}s remaining | {}",
-                timeout.as_secs() - (timeout.as_secs() - elapsed.as_secs()),
-                last_line
-            );
-            last_print = Instant::now();
-        }
+        // if last_print.elapsed() >= Duration::from_secs(10) {
+        //     let elapsed = deadline - Instant::now();
+        //     let last_line = last_serial_line(serial_path);
+        //     println!(
+        //         "  {}s remaining | {}",
+        //         timeout.as_secs() - (timeout.as_secs() - elapsed.as_secs()),
+        //         last_line
+        //     );
+        //     last_print = Instant::now();
+        // }
 
         sleep(Duration::from_secs(1)).await;
     }
@@ -358,16 +358,25 @@ fn results_ready(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn last_serial_line(path: &Path) -> String {
-    fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .last()
-        .unwrap_or("")
-        .to_string()
-}
+// fn last_serial_line(path: &Path) -> String {
+//     fs::read_to_string(path)
+//         .unwrap_or_default()
+//         .lines()
+//         .last()
+//         .unwrap_or("")
+//         .to_string()
+// }
 
 // ── Result extraction ─────────────────────────────────────────────
+
+/// Strip non-JSON prefix/suffix lines (status messages, markers) from between
+/// the RESULTS markers, returning only the JSON object block.
+fn extract_json_block(raw: &str) -> Option<&str> {
+    let start = raw.find('{')?;
+    // walk backward from the end to find the matching closing brace
+    let end = raw.rfind('}')? + 1;
+    Some(&raw[start..end])
+}
 
 fn extract_results(serial_path: &Path) -> Result<Value> {
     let content = fs::read_to_string(serial_path)?;
@@ -381,6 +390,8 @@ fn extract_results(serial_path: &Path) -> Result<Value> {
         .ok_or_else(|| anyhow!("RESULTS_END marker not found"))?;
 
     let json_str = content[start + "===RESULTS_START===".len()..end].trim();
+    let json_str = extract_json_block(json_str)
+        .ok_or_else(|| anyhow!("No JSON object found between markers"))?;
     if json_str.is_empty() {
         // kernel page cache may not have flushed the fio JSON yet —
         // wait a beat and re-read
@@ -393,6 +404,8 @@ fn extract_results(serial_path: &Path) -> Result<Value> {
             .rfind("===RESULTS_END===")
             .ok_or_else(|| anyhow!("RESULTS_END marker not found on retry"))?;
         let json_str2 = content2[start2 + "===RESULTS_START===".len()..end2].trim();
+        let json_str2 = extract_json_block(json_str2)
+            .unwrap_or(json_str2);
         serde_json::from_str(json_str2)
             .with_context(|| format!("Failed to parse JSON between markers on retry. Content: '{}'", json_str2))
     } else {
@@ -423,4 +436,44 @@ fn print_summary(results: &[BenchResultNoi]) {
     println!("  Min:    {:.3}s", sorted[0]);
     println!("  P99:    {:.3}s", p99);
     println!("  Max:    {:.3}s", sorted[sorted.len() - 1]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_json_with_prefix_and_suffix_lines() {
+        // Simulates the actual serial output where status messages
+        // and ===ALL_DONE=== appear between the RESULTS markers.
+        let raw = r#"Running benchmark: mixed with engine: libaio
+{
+  "fio version" : "fio-3.41",
+  "jobs" : [{"jobname":"mixed","read":{"iops":202332}}]
+}
+===ALL_DONE==="#;
+        let json = extract_json_block(raw).expect("should find JSON block");
+        let val: Value = serde_json::from_str(json).expect("should parse");
+        assert_eq!(val["fio version"], "fio-3.41");
+        assert_eq!(val["jobs"][0]["read"]["iops"], 202332);
+    }
+
+    #[test]
+    fn extracts_json_with_only_prefix_line() {
+        let raw = "status line\n{\"x\":1}";
+        let json = extract_json_block(raw).expect("should find JSON block");
+        assert_eq!(json, "{\"x\":1}");
+    }
+
+    #[test]
+    fn extracts_json_with_only_suffix_line() {
+        let raw = "{\"x\":1}\n===ALL_DONE===";
+        let json = extract_json_block(raw).expect("should find JSON block");
+        assert_eq!(json, "{\"x\":1}");
+    }
+
+    #[test]
+    fn returns_none_for_no_braces() {
+        assert!(extract_json_block("just some text").is_none());
+    }
 }

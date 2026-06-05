@@ -1,23 +1,14 @@
 #!/bin/sh
 # V4
 # this script will run the fio job on /vdb and write results to the mounted root disk
-
+# We might want to test different engines.
+#
 MODE=$1
 TEST_DISK=/dev/vdb
 ITERS=${2:-30}
 FORMAT=${3:-json}
-
-# Detect libaio
-if fio --enghelp libaio > /dev/null 2>&1; then
-    ENGINE="libaio"
-    IODEPTH=32
-else
-    echo '{"warning":"libaio not available, using sync"}' > /dev/ttyS0
-    ENGINE="sync"
-    IODEPTH=1
-fi
-
-echo "Running benchmark: $MODE with engine: $ENGINE" > /dev/ttyS0
+ENGINE="libaio"
+IODEPTH=32
 
 # fio section
 case "$MODE" in
@@ -90,5 +81,3 @@ case "$MODE" in
         echo '{"error":"unknown benchmark mode"}' > /dev/ttyS0
         ;;
 esac
-
-echo "===ALL_DONE===" > /dev/ttyS0

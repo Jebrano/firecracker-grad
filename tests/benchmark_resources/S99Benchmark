@@ -11,8 +11,6 @@ case "$1" in
                     MODE="${param#benchmark=}"
                     echo "===RESULTS_START==="  > /dev/ttyS0
                     /root/benchmarks/fio.sh "$MODE"
-                    # Print results to serial with clear delimiters
-                    # so the host harness can parse them out
                     echo "===RESULTS_END==="    > /dev/ttyS0
                     poweroff
                     ;;
