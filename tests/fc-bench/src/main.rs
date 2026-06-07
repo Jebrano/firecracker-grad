@@ -181,7 +181,7 @@ async fn run_one(
         client.start_instance().await?;
 
         // Poll for completion marker
-        wait_for_results(&cfg.serial_out, Duration::from_secs(120)).await?;
+        wait_for_results(&cfg.serial_out, Duration::from_secs(900)).await?;
         // give the kernel page cache a moment to flush buffered writes
         let elapsed = t_start.elapsed().as_secs_f64();
 

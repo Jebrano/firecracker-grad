@@ -7,7 +7,7 @@ MODE=$1
 TEST_DISK=/dev/vdb
 ITERS=${2:-30}
 FORMAT=${3:-json}
-ENGINE="libaio"
+ENGINE="io_uring"
 IODEPTH=32
 
 # fio section
@@ -23,8 +23,6 @@ case "$MODE" in
             --filename=$TEST_DISK \
             --loop="$ITERS" \
             --output-format="$FORMAT" \
-            --time_based \
-            --runtime=10 \
             2>/dev/null > /dev/ttyS0
         ;;
 
@@ -38,8 +36,6 @@ case "$MODE" in
             --filename=$TEST_DISK \
             --output-format="$FORMAT" \
             --loop="$ITERS" \
-            --time_based \
-            --runtime=10 \
             2>/dev/null > /dev/ttyS0
         ;;
 
@@ -53,8 +49,6 @@ case "$MODE" in
             --filename=$TEST_DISK \
             --output-format="$FORMAT" \
             --loop="$ITERS" \
-            --time_based \
-            --runtime=10 \
             2>/dev/null > /dev/ttyS0
         ;;
 
@@ -69,8 +63,6 @@ case "$MODE" in
             --filename=$TEST_DISK \
             --output-format="$FORMAT" \
             --loop="$ITERS" \
-            --time_based \
-            --runtime=10 \
             2>/dev/null > /dev/ttyS0
         ;;
     *)
