@@ -9,6 +9,10 @@ license = "Apache-2.0"
 [[bin]]
 name = "fc-bench"
 
+[lib]
+name = "fc_bench"
+path = "src/lib.rs"
+
 [dependencies]
 hyper = {version = "1.9.0", features = ["http1", "client"]}
 hyperlocal = "0.9.1"

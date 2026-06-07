@@ -1,8 +1,6 @@
-mod fc_client;
-
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
-use fc_client::FcClient;
+use fc_bench::fc_client::FcClient;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -151,7 +149,7 @@ async fn run_one(
 
         // Configure the VM
         let boot_args = format!(
-            "console=ttyS0 reboot=k panic=1 pci=off benchmark={}",
+            "console=ttyS0 reboot=k panic=1 pci=off benchmark={} ",
             mode.as_str()
         );
         client.set_boot_source(
