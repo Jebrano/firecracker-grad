@@ -1,16 +1,20 @@
 #!/bin/sh
-# V6
-# this script will run the fio job on /vdb and write results to the mounted root disk
-# We might want to test different engines.
-#
-MODE=$1
-TEST_DISK=/dev/vdb
-ITERS=${2:-30}
-FORMAT=${3:-json}
-ENGINE="libaio"
-IODEPTH=32
 
-# fio section
+MODE=$1
+ITERATIONS=${2:-30}
+
+echo "Starting $ITERATIONS iterations of $MODE" > /dev/console
+
+# Detect engine once, not per iteration
+if fio --enghelp libaio > /dev/null 2>&1; then
+    ENGINE="libaio"
+    IODEPTH=32
+else
+    ENGINE="sync"
+    IODEPTH=1
+fi
+
+
 case "$MODE" in
 
     rand_read)
@@ -20,24 +24,9 @@ case "$MODE" in
             --rw=randread \
             --bs=4k \
             --direct=1 \
-            --filename=$TEST_DISK \
-            --loop="$ITERS" \
-            --output-format="$FORMAT" \
-            --time_based \
-            --runtime=10 \
-            2>/dev/null > /dev/ttyS0
-        ;;
-
-    seq_write)
-        fio --name=seqwrite \
-            --ioengine=$ENGINE \
-            --iodepth=$IODEPTH \
-            --rw=write \
-            --bs=128k \
-            --direct=1 \
-            --filename=$TEST_DISK \
-            --output-format="$FORMAT" \
-            --loop="$ITERS" \
+            --size=512M \
+            --filename=/dev/vdb \
+            --output-format=json \
             --time_based \
             --runtime=10 \
             2>/dev/null > /dev/ttyS0
@@ -50,9 +39,24 @@ case "$MODE" in
             --rw=randwrite \
             --bs=4k \
             --direct=1 \
-            --filename=$TEST_DISK \
-            --output-format="$FORMAT" \
-            --loop="$ITERS" \
+            --size=512M \
+            --filename=/dev/vdb \
+            --output-format=json \
+            --time_based \
+            --runtime=10 \
+            2>/dev/null > /dev/ttyS0
+        ;;
+
+    seq_write)
+        fio --name=seqwrite \
+            --ioengine=$ENGINE \
+            --iodepth=1 \
+            --rw=write \
+            --bs=128k \
+            --direct=1 \
+            --size=512M \
+            --filename=/dev/vdb \
+            --output-format=json \
             --time_based \
             --runtime=10 \
             2>/dev/null > /dev/ttyS0
@@ -66,14 +70,18 @@ case "$MODE" in
             --rwmixread=70 \
             --bs=4k \
             --direct=1 \
-            --filename=$TEST_DISK \
-            --output-format="$FORMAT" \
-            --loop="$ITERS" \
+            --size=512M \
+            --filename=/dev/vdb \
+            --output-format=json \
             --time_based \
             --runtime=10 \
             2>/dev/null > /dev/ttyS0
         ;;
     *)
-        echo '{"error":"unknown benchmark mode"}' > /dev/ttyS0
+        echo "{\"error\": \"unknown mode: $MODE\"}" > /dev/ttyS0
         ;;
 esac
+
+
+# echo "===ALL_DONE===" > /dev/ttyS0
+poweroff
