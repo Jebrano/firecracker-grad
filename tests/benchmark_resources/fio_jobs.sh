@@ -5,10 +5,26 @@
 #
 MODE=$1
 TEST_DISK=/dev/vdb
-ITERS=${2:-30}
+ITERS=${2:-20}
 FORMAT=${3:-json}
 ENGINE="io_uring"
 IODEPTH=32
+
+# Parse colon-delimited overrides from MODE (e.g. "rand_read:iters=50")
+case "$MODE" in
+    *:*)
+        MODE_BASE="${MODE%%:*}"
+        PARAMS="${MODE#*:}"
+        OLD_IFS="$IFS"; IFS=':'
+        for pair in $PARAMS; do
+            case "$pair" in
+                iters=*) ITERS="${pair#iters=}" ;;
+            esac
+        done
+        IFS="$OLD_IFS"
+        MODE="$MODE_BASE"
+        ;;
+esac
 
 # fio section
 case "$MODE" in
