@@ -67,10 +67,6 @@ struct Args {
     #[arg(long, default_value = "1000")]
     gid: u32,
 
-    /// Network namespace path (optional)
-    #[arg(long)]
-    netns: Option<String>,
-
     /// Daemonize the jailer
     #[arg(long)]
     daemonize: bool,
@@ -88,7 +84,6 @@ struct Config {
     jailer_id:   String,
     uid:         u32,
     gid:         u32,
-    netns:       Option<String>,
     daemonize:   bool,
     /// Host-visible path to the API socket inside the chroot
     socket:      PathBuf,
@@ -122,7 +117,6 @@ impl Config {
             jailer_id:   args.jailer_id.clone(),
             uid:         args.uid,
             gid:         args.gid,
-            netns:       args.netns.clone(),
             daemonize:   args.daemonize,
             socket:      chroot_root.join("run/firecracker.socket"),
             serial_out:  base.join("serial-output.txt"),
@@ -214,9 +208,9 @@ async fn run_one(
         let t_start = Instant::now();
         client.start_instance().await?;
         wait_for_results(&cfg.serial_out, Duration::from_secs(120)).await?;
-        sleep(Duration::from_millis(200)).await;
 
         let elapsed = t_start.elapsed().as_secs_f64();
+        sleep(Duration::from_millis(200)).await;
         let fio_json = extract_results(&cfg.serial_out)?;
 
         Ok::<BenchResult, anyhow::Error>(BenchResult {
@@ -250,9 +244,6 @@ fn start_jailer(cfg: &Config) -> Result<Child> {
         "--chroot-base-dir", cfg.chroot_base.to_str().unwrap(),
     ]);
 
-    if let Some(ref ns) = cfg.netns {
-        cmd.args(["--netns", ns]);
-    }
     if cfg.daemonize {
         cmd.arg("--daemonize");
     }
