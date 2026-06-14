@@ -480,6 +480,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
+name = "def-jailer-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-client-sockets",
+ "hyper-util",
+ "hyperlocal",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "derive_more"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
