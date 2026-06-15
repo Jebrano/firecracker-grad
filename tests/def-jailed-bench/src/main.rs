@@ -62,6 +62,10 @@ struct Args {
     /// Daemonize the jailer
     #[arg(long)]
     daemonize: bool,
+
+    /// Fio overrides: "bs=1M:iodepth=1" or "iters=100"
+    #[arg(long)]
+    bench_params: Option<String>,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -160,16 +164,21 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let cfg = Config::new(&args);
 
+    let mode_str = match &args.bench_params {
+        Some(p) if !p.is_empty() => format!("{}:{}", args.mode.as_str(), p),
+        _ => args.mode.as_str().to_string(),
+    };
+
     println!(
         "Running {} x {} | Landlock: {}",
-        args.mode.as_str(),
+        mode_str,
         args.iterations,
         args.landlock
     );
 
     let mut all_results: Vec<BenchResult> = Vec::new();
 
-    let result = run_one(&cfg, &args.mode, args.iterations, args.landlock).await?;
+    let result = run_one(&cfg, &mode_str, args.iterations, args.landlock).await?;
     println!(" Completed in {:.2}s", result.total_time_s);
 
     all_results.push(result);
@@ -186,7 +195,7 @@ async fn main() -> Result<()> {
 // Will modify it for sysbench later
 async fn run_one(
     cfg: &Config,
-    mode: &BenchMode,
+    mode_str: &str,
     iteration: u32,
     landlock: bool,
 ) -> Result<BenchResult> {
@@ -218,7 +227,7 @@ async fn run_one(
         // Configure the VM — paths are relative to chroot root
         let boot_args = format!(
             "console=ttyS0 reboot=k panic=1 pci=off benchmark={} ",
-            mode.as_str()
+            mode_str
         );
 
         // Resources were copied into chroot root; only filenames needed
@@ -262,7 +271,7 @@ async fn run_one(
         let fio_json = extract_results(&cfg.serial_out)?;
 
         Ok::<BenchResult, anyhow::Error>(BenchResult {
-            mode:         mode.as_str().to_string(),
+            mode:         mode_str.to_string(),
             landlock,
             iteration,
             total_time_s: elapsed,
