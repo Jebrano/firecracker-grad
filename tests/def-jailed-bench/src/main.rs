@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     fs,
+    os::unix::fs::chown,
     path::{Path, PathBuf},
     process::{Child, Command},
     time::{Duration, Instant},
@@ -200,9 +201,9 @@ async fn run_one(
     // Pre-create the chroot root and copy resources into it.
     // The jailer will chroot here; firecracker can only see files inside.
     fs::create_dir_all(&cfg.chroot_root)?;
-    copy_into_jail(&cfg.chroot_root, &cfg.kernel)?;
-    copy_into_jail(&cfg.chroot_root, &cfg.rootfs)?;
-    copy_into_jail(&cfg.chroot_root, &cfg.bench_disk)?;
+    copy_into_jail(&cfg.chroot_root, &cfg.kernel, cfg.uid, cfg.gid)?;
+    copy_into_jail(&cfg.chroot_root, &cfg.rootfs, cfg.uid, cfg.gid)?;
+    copy_into_jail(&cfg.chroot_root, &cfg.bench_disk, cfg.uid, cfg.gid)?;
     println!("Resources copied into chroot: {}", cfg.chroot_root.display());
 
     // Start the jailer (which execs firecracker inside the sandbox)
@@ -283,14 +284,16 @@ async fn run_one(
 
 // ── Process management ────────────────────────────────────────────
 
-/// Copy a file into the jail chroot so firecracker can see it.
-fn copy_into_jail(chroot_root: &Path, src: &Path) -> Result<()> {
+/// Copy a file into the jail chroot and chown it so firecracker can read it.
+fn copy_into_jail(chroot_root: &Path, src: &Path, uid: u32, gid: u32) -> Result<()> {
     let name = src.file_name()
         .ok_or_else(|| anyhow!("No filename in {:?}", src))?;
     let dst = chroot_root.join(name);
     if !dst.exists() {
         println!("  Copying {} -> {}", src.display(), dst.display());
         std::fs::copy(src, &dst)?;
+        // Firecracker runs as this uid/gid after the jailer drops privileges
+        chown(&dst, Some(uid), Some(gid))?;
     }
     Ok(())
 }
