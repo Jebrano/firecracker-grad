@@ -194,6 +194,9 @@ async fn run_one(
     let _ = fs::remove_file(&cfg.socket);
     let _ = fs::remove_file(&cfg.serial_out);
 
+    // Wipe previous chroot to avoid "File exists" errors from mknod
+    let _ = fs::remove_dir_all(&cfg.chroot_root);
+
     // Pre-create the chroot root and copy resources into it.
     // The jailer will chroot here; firecracker can only see files inside.
     fs::create_dir_all(&cfg.chroot_root)?;
