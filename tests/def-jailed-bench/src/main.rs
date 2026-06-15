@@ -207,7 +207,7 @@ async fn run_one(
 
     let result = async {
         // Socket appears inside the chroot — visible on host at the full path
-        wait_for_socket(&cfg.socket, Duration::from_secs(15), &mut jailer).await?;
+        wait_for_socket(&cfg.socket, Duration::from_secs(15), &mut jailer, &cfg.fc_log).await?;
 
         let client = FcClient::new(cfg.socket.to_str().unwrap());
 
@@ -330,19 +330,19 @@ fn start_jailer(cfg: &Config) -> Result<Child> {
 
 // ── Polling helpers ───────────────────────────────────────────────
 
-async fn wait_for_socket(path: &Path, timeout: Duration, child: &mut Child) -> Result<()> {
+async fn wait_for_socket(path: &Path, timeout: Duration, child: &mut Child, log_path: &Path) -> Result<()> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        // If the jailer process died, grab its exit status and fail early
         match child.try_wait() {
             Ok(Some(status)) => {
+                let log = fs::read_to_string(log_path).unwrap_or_default();
+                let tail: String = log.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
                 return Err(anyhow!(
-                    "Jailer exited early with {} before socket appeared.\n\
-                     Run with sudo? Check /srv/jailer/ exists.",
-                    status
+                    "Jailer exited early with {}.\nLast 10 lines of jailer log:\n{}",
+                    status, tail
                 ));
             }
-            Ok(None) => {}  // still running
+            Ok(None) => {}
             Err(e) => return Err(anyhow!("Failed to check jailer status: {}", e)),
         }
         if path.exists() {
