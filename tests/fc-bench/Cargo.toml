@@ -6,9 +6,6 @@ edition = "2024"
 description = "This is a custom test benchmarking tool."
 license = "Apache-2.0"
 
-[[bin]]
-name = "fc-bench"
-
 [lib]
 name = "fc_bench"
 path = "src/lib.rs"

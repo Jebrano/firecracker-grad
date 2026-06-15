@@ -32,6 +32,35 @@ struct Args {
     /// Path to the kernel image
     #[arg(long)]
     kernel: PathBuf,
+
+    // --- jailer knobs ---
+    /// Jailer binary path
+    #[arg(long, default_value = "/mydata/fc-bench/jailer")]
+    jailer_path: PathBuf,
+
+    /// Chroot base directory
+    #[arg(long, default_value = "/srv/jailer")]
+    chroot_base: PathBuf,
+
+    /// Jail instance ID
+    #[arg(long, default_value = "fc-bench-0")]
+    jailer_id: String,
+
+    /// UID to switch to after setup
+    #[arg(long, default_value = "1000")]
+    uid: u32,
+
+    /// GID to switch to after setup
+    #[arg(long, default_value = "1000")]
+    gid: u32,
+
+    /// Network namespace path (optional)
+    #[arg(long)]
+    netns: Option<String>,
+
+    /// Daemonize the jailer
+    #[arg(long)]
+    daemonize: bool,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -56,30 +85,53 @@ impl BenchMode {
 // ── Config ────────────────────────────────────────────────────────
 
 struct Config {
-    fc_binary:  PathBuf,
-    kernel:     PathBuf,
-    rootfs:     PathBuf,
-    bench_disk: PathBuf,
-    socket:     PathBuf,
-    serial_out: PathBuf,
-    fc_log:     PathBuf,
+    jailer_path: PathBuf,
+    fc_binary:   PathBuf,
+    kernel:      PathBuf,
+    rootfs:      PathBuf,
+    bench_disk:  PathBuf,
+    chroot_base: PathBuf,
+    jailer_id:   String,
+    uid:         u32,
+    gid:         u32,
+    netns:       Option<String>,
+    daemonize:   bool,
+    /// Host-visible path to the API socket inside the chroot
+    socket:      PathBuf,
+    serial_out:  PathBuf,
+    fc_log:      PathBuf,
 }
 
 impl Config {
-    fn new(landlock: bool, kernel: PathBuf) -> Self {
+    fn new(args: &Args) -> Self {
         let base = Path::new("/users/Jubranoo/fc-bench");
+        let fc_binary = base.join(if args.landlock {
+            "firecracker-landlock"
+        } else {
+            "firecracker"
+        });
+
+        // Jailer chroot: <chroot-base>/firecracker/<id>/root/
+        let chroot_root = args.chroot_base
+            .join("firecracker")
+            .join(&args.jailer_id)
+            .join("root");
+
         Self {
-            fc_binary:  base.join(if landlock {
-                "firecracker-landlock"
-            } else {
-                "firecracker"
-            }),
-            kernel,
-            rootfs:     base.join("rootfs-baseline.ext4"),
-            bench_disk: base.join("bench-disk.raw"),
-            socket:     PathBuf::from("/tmp/fc-bench.socket"),
-            serial_out: base.join("serial-output.txt"),
-            fc_log:     base.join("fc.log"),
+            jailer_path: args.jailer_path.clone(),
+            fc_binary,
+            kernel:      args.kernel.clone(),
+            rootfs:      base.join("rootfs-baseline.ext4"),
+            bench_disk:  base.join("bench-disk.raw"),
+            chroot_base: args.chroot_base.clone(),
+            jailer_id:   args.jailer_id.clone(),
+            uid:         args.uid,
+            gid:         args.gid,
+            netns:       args.netns.clone(),
+            daemonize:   args.daemonize,
+            socket:      chroot_root.join("run/firecracker.socket"),
+            serial_out:  base.join("serial-output.txt"),
+            fc_log:      base.join("fc.log"),
         }
     }
 }
@@ -102,7 +154,7 @@ struct BenchResult {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let cfg = Config::new(args.landlock, args.kernel);
+    let cfg = Config::new(&args);
 
     println!(
         "Running {} x {} | Landlock: {}",
@@ -139,11 +191,12 @@ async fn run_one(
     let _ = fs::remove_file(&cfg.socket);
     let _ = fs::remove_file(&cfg.serial_out);
 
-    // Start Firecracker
-    let mut fc = start_firecracker(cfg)?;
+    // Start the jailer (which execs firecracker inside the sandbox)
+    let mut jailer = start_jailer(cfg)?;
 
     let result = async {
-        wait_for_socket(&cfg.socket, Duration::from_secs(5)).await?;
+        // Socket appears inside the chroot — visible on host at the full path
+        wait_for_socket(&cfg.socket, Duration::from_secs(15)).await?;
 
         let client = FcClient::new(cfg.socket.to_str().unwrap());
 
@@ -200,9 +253,9 @@ async fn run_one(
 
 
 
-    // Always kill Firecracker regardless of success or failure
-    let _ = fc.kill();
-    let _ = fc.wait();
+    // Always kill the jailer (which kills firecracker)
+    let _ = jailer.kill();
+    let _ = jailer.wait();
 
     result
 }
@@ -210,21 +263,39 @@ async fn run_one(
 
 // ── Process management ────────────────────────────────────────────
 
-fn start_firecracker(cfg: &Config) -> Result<Child> {
+fn start_jailer(cfg: &Config) -> Result<Child> {
     let serial_file = fs::File::create(&cfg.serial_out)?;
     let log_file    = fs::File::create(&cfg.fc_log)?;
 
-    let child = Command::new(&cfg.fc_binary)
-        .args([
-            "--api-sock", cfg.socket.to_str().unwrap(),
-            "--log-path", cfg.fc_log.to_str().unwrap(),
-            "--level",    "Info",
-        ])
-        .stdout(serial_file)
-        .stderr(log_file)
-        .spawn()?;
+    let mut cmd = Command::new(&cfg.jailer_path);
+    cmd.args([
+        "--id",              &cfg.jailer_id,
+        "--exec-file",       cfg.fc_binary.to_str().unwrap(),
+        "--uid",             &cfg.uid.to_string(),
+        "--gid",             &cfg.gid.to_string(),
+        "--chroot-base-dir", cfg.chroot_base.to_str().unwrap(),
+    ]);
 
-    println!("Firecracker PID: {}", child.id());
+    if let Some(ref ns) = cfg.netns {
+        cmd.args(["--netns", ns]);
+    }
+    if cfg.daemonize {
+        cmd.arg("--daemonize");
+    }
+
+    // Everything after -- is forwarded to firecracker.
+    // Paths are relative to chroot root.
+    cmd.arg("--")
+       .args([
+           "--api-sock", "run/firecracker.socket",
+           "--log-path", "fc.log",
+           "--level",    "Info",
+       ])
+       .stdout(serial_file)     // VM serial console
+       .stderr(log_file);       // firecracker log
+
+    let child = cmd.spawn()?;
+    println!("Jailer PID: {}  (socket: {})", child.id(), cfg.socket.display());
     Ok(child)
 }
 
