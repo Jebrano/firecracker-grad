@@ -35,7 +35,7 @@ struct Args {
 
     // --- jailer knobs ---
     /// Jailer binary path
-    #[arg(long, default_value = "/mydata/fc-bench/jailer")]
+    #[arg(long, default_value = "/users/Jubranoo/fc-bench/jailer")]
     jailer_path: PathBuf,
 
     /// Chroot base directory
@@ -105,11 +105,11 @@ struct Config {
 impl Config {
     fn new(args: &Args) -> Self {
         let base = Path::new("/users/Jubranoo/fc-bench");
-        let fc_binary = base.join(if args.landlock {
-            "firecracker-landlock"
+        let fc_binary = if args.landlock {
+            base.join("firecracker-landlock")
         } else {
-            "firecracker"
-        });
+            PathBuf::from("/users/Jubranoo/fc-bench/firecracker")
+        };
 
         // Jailer chroot: <chroot-base>/firecracker/<id>/root/
         let chroot_root = args.chroot_base
@@ -196,7 +196,7 @@ async fn run_one(
 
     let result = async {
         // Socket appears inside the chroot — visible on host at the full path
-        wait_for_socket(&cfg.socket, Duration::from_secs(15)).await?;
+        wait_for_socket(&cfg.socket, Duration::from_secs(15), &mut jailer).await?;
 
         let client = FcClient::new(cfg.socket.to_str().unwrap());
 
@@ -301,15 +301,27 @@ fn start_jailer(cfg: &Config) -> Result<Child> {
 
 // ── Polling helpers ───────────────────────────────────────────────
 
-async fn wait_for_socket(path: &Path, timeout: Duration) -> Result<()> {
+async fn wait_for_socket(path: &Path, timeout: Duration, child: &mut Child) -> Result<()> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
+        // If the jailer process died, grab its exit status and fail early
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(anyhow!(
+                    "Jailer exited early with {} before socket appeared.\n\
+                     Run with sudo? Check /srv/jailer/ exists.",
+                    status
+                ));
+            }
+            Ok(None) => {}  // still running
+            Err(e) => return Err(anyhow!("Failed to check jailer status: {}", e)),
+        }
         if path.exists() {
             return Ok(());
         }
         sleep(Duration::from_millis(100)).await;
     }
-    Err(anyhow!("Socket {:?} never appeared", path))
+    Err(anyhow!("Socket {:?} never appeared after {:?}", path, timeout))
 }
 
 async fn wait_for_results(serial_path: &Path, timeout: Duration) -> Result<()> {
