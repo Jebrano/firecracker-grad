@@ -98,6 +98,8 @@ struct Config {
     daemonize:   bool,
     /// Host-visible path to the API socket inside the chroot
     socket:      PathBuf,
+    /// Host-visible path to the chroot root (where kernel/rootfs are copied)
+    chroot_root: PathBuf,
     serial_out:  PathBuf,
     fc_log:      PathBuf,
 }
@@ -130,6 +132,7 @@ impl Config {
             netns:       args.netns.clone(),
             daemonize:   args.daemonize,
             socket:      chroot_root.join("run/firecracker.socket"),
+            chroot_root,
             serial_out:  base.join("serial-output.txt"),
             fc_log:      base.join("fc.log"),
         }
@@ -191,6 +194,14 @@ async fn run_one(
     let _ = fs::remove_file(&cfg.socket);
     let _ = fs::remove_file(&cfg.serial_out);
 
+    // Pre-create the chroot root and copy resources into it.
+    // The jailer will chroot here; firecracker can only see files inside.
+    fs::create_dir_all(&cfg.chroot_root)?;
+    copy_into_jail(&cfg.chroot_root, &cfg.kernel)?;
+    copy_into_jail(&cfg.chroot_root, &cfg.rootfs)?;
+    copy_into_jail(&cfg.chroot_root, &cfg.bench_disk)?;
+    println!("Resources copied into chroot: {}", cfg.chroot_root.display());
+
     // Start the jailer (which execs firecracker inside the sandbox)
     let mut jailer = start_jailer(cfg)?;
 
@@ -200,24 +211,30 @@ async fn run_one(
 
         let client = FcClient::new(cfg.socket.to_str().unwrap());
 
-        // Configure the VM
+        // Configure the VM — paths are relative to chroot root
         let boot_args = format!(
             "console=ttyS0 reboot=k panic=1 pci=off benchmark={} ",
             mode.as_str()
         );
+
+        // Resources were copied into chroot root; only filenames needed
+        let kernel_name = cfg.kernel.file_name().unwrap().to_str().unwrap();
+        let rootfs_name = cfg.rootfs.file_name().unwrap().to_str().unwrap();
+        let bench_name  = cfg.bench_disk.file_name().unwrap().to_str().unwrap();
+
         client.set_boot_source(
-            cfg.kernel.to_str().unwrap(),
+            &format!("/{}", kernel_name),
             &boot_args
         ).await?;
         client.add_drive(
             "rootfs",
-            cfg.rootfs.to_str().unwrap(),
+            &format!("/{}", rootfs_name),
             true,
             false
         ).await?;
         client.add_drive(
             "benchdisk",
-            cfg.bench_disk.to_str().unwrap(),
+            &format!("/{}", bench_name),
             false,
             false
         ).await?;
@@ -262,6 +279,18 @@ async fn run_one(
 
 
 // ── Process management ────────────────────────────────────────────
+
+/// Copy a file into the jail chroot so firecracker can see it.
+fn copy_into_jail(chroot_root: &Path, src: &Path) -> Result<()> {
+    let name = src.file_name()
+        .ok_or_else(|| anyhow!("No filename in {:?}", src))?;
+    let dst = chroot_root.join(name);
+    if !dst.exists() {
+        println!("  Copying {} -> {}", src.display(), dst.display());
+        std::fs::copy(src, &dst)?;
+    }
+    Ok(())
+}
 
 fn start_jailer(cfg: &Config) -> Result<Child> {
     let serial_file = fs::File::create(&cfg.serial_out)?;
