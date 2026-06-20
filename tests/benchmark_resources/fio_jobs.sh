@@ -5,7 +5,7 @@
 #
 MODE=$1
 TEST_DISK=/dev/vdb
-ITERS=${2:-20}
+ITERS=${2:-30}
 FORMAT=${3:-json}
 ENGINE="io_uring"
 IODEPTH=32
