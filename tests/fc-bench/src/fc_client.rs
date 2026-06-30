@@ -1,12 +1,13 @@
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::{Method, Request, StatusCode};
+use hyper::{Method, Request};
 use hyperlocal::{UnixClientExt, Uri};
 use hyper_util::client::legacy::Client;
 use serde::Serialize;
 use serde_json::Value;
 
+#[derive(Debug)]
 pub struct FcClient {
     socket_path: String,
     client: Client<hyperlocal::UnixConnector, Full<Bytes>>,

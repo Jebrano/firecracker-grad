@@ -4,6 +4,7 @@ use fc_bench::fc_client::FcClient;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     process::{Child, Command},
@@ -86,6 +87,17 @@ impl Config {
 
 // ── Results ───────────────────────────────────────────────────────
 // With Iteration
+/// A single entry from a fio built-in time-series log.
+#[derive(Debug, Serialize, Deserialize)]
+struct FioLogEntry {
+    timestamp_ms: u64,
+    value:        u64,
+    /// 0 = read, 1 = write
+    direction:    u8,
+    /// Only present for latency logs (clat/slat), absent for iops/bw
+    block_size:   Option<u64>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct BenchResult {
     mode:           String,
@@ -93,6 +105,7 @@ struct BenchResult {
     iteration:      u32,
     total_time_s:   f64,
     fio:            Value,
+    fio_logs:       HashMap<String, Vec<FioLogEntry>>,
     instance_info:  Value,
     machine_config: Value,
 }
@@ -184,8 +197,8 @@ async fn run_one(
         let elapsed = t_start.elapsed().as_secs_f64();
 
         sleep(Duration::from_millis(200)).await;
-        // Extract JSON from serial output
-        let fio_json = extract_results(&cfg.serial_out)?;
+        // Extract JSON and fio built-in logs from serial output
+        let (fio_json, fio_logs) = extract_blocks(&cfg.serial_out)?;
 
         Ok::<BenchResult, anyhow::Error>(BenchResult {
             mode:         mode.as_str().to_string(),
@@ -193,6 +206,7 @@ async fn run_one(
             iteration,
             total_time_s: elapsed,
             fio:          fio_json,
+            fio_logs,
             instance_info,
             machine_config,
         })
@@ -285,26 +299,92 @@ fn results_ready(path: &Path) -> bool {
 
 // ── Result extraction ─────────────────────────────────────────────
 
-/// Strip non-JSON prefix/suffix lines (status messages, markers) from between
-/// the RESULTS markers, returning only the JSON object block.
-fn extract_json_block(raw: &str) -> Option<&str> {
-    let start = raw.find('{')?;
-    // walk backward from the end to find the matching closing brace
-    let end = raw.rfind('}')? + 1;
-    Some(&raw[start..end])
-}
-
-fn extract_results(serial_path: &Path) -> Result<Value> {
+/// Parse the multi-block serial output into fio JSON + named log blocks.
+///
+/// Expected format:
+/// ```text
+/// {fio JSON output}
+/// ===FIO_JSON_END===
+/// ===FIO_LOG iops===
+/// 123,456,789
+/// ...
+/// ===FIO_LOG_END===
+/// ===FIO_LOG bw===
+/// ...
+/// ===FIO_LOG_END===
+/// ```
+fn extract_blocks(serial_path: &Path) -> Result<(Value, HashMap<String, Vec<FioLogEntry>>)> {
     let content = fs::read_to_string(serial_path)?;
 
+    let json_str = extract_json_block(&content)
+        .ok_or_else(|| anyhow!("No JSON object found in serial output"))?;
 
-    let json_str = content.trim();
-    let json_str = extract_json_block(json_str)
-        .ok_or_else(|| anyhow!("No JSON object found between markers"))?;
+    let fio_json: Value = serde_json::from_str(json_str)
+        .with_context(|| format!("Failed to parse fio JSON: '{}'", json_str))?;
 
+    let mut fio_logs: HashMap<String, Vec<FioLogEntry>> = HashMap::new();
+    let mut current_tag = String::new();
+    let mut current_buf = String::new();
+    let mut collecting = false;
 
-    serde_json::from_str(json_str)
-        .with_context(|| format!("Failed to parse JSON between markers. Content: '{}'", json_str))
+    for line in content.lines() {
+        if let Some(tag) = line.strip_prefix("===FIO_LOG ").and_then(|s| s.strip_suffix("===")) {
+            current_tag = tag.to_string();
+            current_buf.clear();
+            collecting = true;
+            continue;
+        }
+        if line == "===FIO_LOG_END===" && collecting {
+            fio_logs.insert(
+                current_tag.clone(),
+                parse_fio_log(&current_buf),
+            );
+            collecting = false;
+            continue;
+        }
+        if collecting {
+            current_buf.push_str(line);
+            current_buf.push('\n');
+        }
+    }
+
+    Ok((fio_json, fio_logs))
+}
+
+/// Convert raw fio log lines (CSV) into structured entries.
+///
+/// fio iops/bw logs:    `timestamp_ms, value, direction`
+/// fio lat/clat/slat logs: `timestamp_ms, value, direction, block_size`
+fn parse_fio_log(raw: &str) -> Vec<FioLogEntry> {
+    raw.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| {
+            let parts: Vec<&str> = l.split(',').map(|s| s.trim()).collect();
+            match parts.len() {
+                3 => Some(FioLogEntry {
+                    timestamp_ms: parts[0].parse().ok()?,
+                    value:        parts[1].parse().ok()?,
+                    direction:    parts[2].parse().ok()?,
+                    block_size:   None,
+                }),
+                4 => Some(FioLogEntry {
+                    timestamp_ms: parts[0].parse().ok()?,
+                    value:        parts[1].parse().ok()?,
+                    direction:    parts[2].parse().ok()?,
+                    block_size:   parts[3].parse().ok(),
+                }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Strip non-JSON prefix/suffix lines from between the RESULTS markers,
+/// returning only the JSON object block.
+fn extract_json_block(raw: &str) -> Option<&str> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')? + 1;
+    Some(&raw[start..end])
 }
 
 // ── Summary ───────────────────────────────────────────────────────
@@ -373,5 +453,39 @@ mod tests {
     #[test]
     fn returns_none_for_no_braces() {
         assert!(extract_json_block("just some text").is_none());
+    }
+
+    #[test]
+    fn parses_iops_log_lines() {
+        let raw = "123,456,0\n124,789,1\n";
+        let entries = parse_fio_log(raw);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].timestamp_ms, 123);
+        assert_eq!(entries[0].value, 456);
+        assert_eq!(entries[0].direction, 0);
+        assert_eq!(entries[1].direction, 1);
+    }
+
+    #[test]
+    fn parses_lat_log_lines_with_block_size() {
+        let raw = "555,1000,0,4096\n556,1500,1,8192\n";
+        let entries = parse_fio_log(raw);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].block_size, Some(4096));
+        assert_eq!(entries[1].block_size, Some(8192));
+    }
+
+    #[test]
+    fn parses_fio_log_with_empty_lines() {
+        let raw = "\n\n123,456,0\n\n124,789,1\n\n";
+        let entries = parse_fio_log(raw);
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn parses_fio_log_with_malformed_lines() {
+        let raw = "123,456,0\nbad_line\n124,789,1\n";
+        let entries = parse_fio_log(raw);
+        assert_eq!(entries.len(), 2);
     }
 }

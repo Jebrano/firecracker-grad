@@ -1,9 +1,26 @@
 [package]
 name = "landlock-jailer"
 version = "0.1.0"
+author = ["Jubran Almarri"]
 edition = "2024"
+description = "Custom jailer; replacing file system isolation with a landlock layer, keeping everything else the same."
+
+[[bin]]
+name = "landlock-jailer"
+bench = false
+
+[features]
+tracing = ["log-instrument", "utils/tracing"]
 
 [dependencies]
+libc = "0.2.186"
+landlock = "0.4.5"
+log-instrument = { path = "../log-instrument", optional = true }
+regex = { version = "1.12.3", default-features = false, features = ["std"] }
+thiserror = "2.0.18"
+vmm-sys-util = "0.15.0"
+
+utils = { path = "../utils" }
 
 [lints]
 workspace = true
