@@ -152,6 +152,8 @@ pub enum JailerError {
     UTF8Parsing(std::str::Utf8Error),
     #[error("{}", format!("Failed to write to {:?}: {}", .0, .1).replace('\"', ""))]
     Write(PathBuf, io::Error),
+    #[error("Landlock error: {0}")]
+    Landlock(String),
 }
 
 /// Create an ArgParser object which contains info about the command line argument parser and

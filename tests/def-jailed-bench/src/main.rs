@@ -75,6 +75,10 @@ enum BenchMode {
     RandWrite,
     SeqWrite,
     Mixed,
+    /// Metadata stress — creates/stats/reads/unlinks files on a pre-formatted ext4 disk
+    FileOps,
+    /// Drop to an interactive shell on the serial console (for debugging)
+    Shell,
 }
 
 impl BenchMode {
@@ -84,7 +88,18 @@ impl BenchMode {
             BenchMode::RandWrite => "rand_write",
             BenchMode::SeqWrite  => "seq_write",
             BenchMode::Mixed     => "mixed",
+            BenchMode::FileOps   => "file_ops",
+            BenchMode::Shell     => "shell",
         }
+    }
+
+    #[allow(dead_code)]
+    fn is_file_ops(&self) -> bool {
+        matches!(self, BenchMode::FileOps)
+    }
+
+    fn is_shell(&self) -> bool {
+        matches!(self, BenchMode::Shell)
     }
 }
 
@@ -96,6 +111,8 @@ struct Config {
     kernel:      PathBuf,
     rootfs:      PathBuf,
     bench_disk:  PathBuf,
+    /// Pre-formatted ext4 image for file_ops benchmark
+    bench_fs:    PathBuf,
     chroot_base: PathBuf,
     jailer_id:   String,
     uid:         u32,
@@ -111,6 +128,11 @@ struct Config {
 }
 
 impl Config {
+    /// Return the disk image path for the given benchmark mode
+    fn bench_image(&self, is_file_ops: bool) -> &Path {
+        if is_file_ops { &self.bench_fs } else { &self.bench_disk }
+    }
+
     fn new(args: &Args) -> Self {
         let base = Path::new("/users/Jubranoo/fc-bench");
         let fc_binary = if args.landlock {
@@ -131,6 +153,7 @@ impl Config {
             kernel:      args.kernel.clone(),
             rootfs:      base.join("rootfs-baseline.ext4"),
             bench_disk:  base.join("bench-disk.raw"),
+            bench_fs:    base.join("bench-fs.ext4"),
             chroot_base: args.chroot_base.clone(),
             jailer_id:   args.jailer_id.clone(),
             uid:         args.uid,
@@ -225,11 +248,30 @@ async fn run_one(
     fs::create_dir_all(&cfg.chroot_root)?;
     copy_into_jail(&cfg.chroot_root, &cfg.kernel, cfg.uid, cfg.gid)?;
     copy_into_jail(&cfg.chroot_root, &cfg.rootfs, cfg.uid, cfg.gid)?;
-    copy_into_jail(&cfg.chroot_root, &cfg.bench_disk, cfg.uid, cfg.gid)?;
+    let is_file_ops = mode_str.starts_with("file_ops");
+    copy_into_jail(&cfg.chroot_root, cfg.bench_image(is_file_ops), cfg.uid, cfg.gid)?;
     println!("Resources copied into chroot: {}", cfg.chroot_root.display());
 
     // Start the jailer (which execs firecracker inside the sandbox)
     let mut jailer = start_jailer(cfg)?;
+
+    // Shell mode: skip API setup, just wait for guest to poweroff
+    if mode_str == "shell" {
+        println!("Shell mode: jailer PID {} — attach with:  tail -f {}",
+                 jailer.id(), cfg.serial_out.display());
+        let status = jailer.wait()?;
+        println!("Jailer exited with: {}", status);
+        return Ok(BenchResult {
+            mode:         "shell".to_string(),
+            landlock,
+            iteration:     0,
+            total_time_s:   0.0,
+            fio:            serde_json::json!({"shell": "exited"}),
+            fio_logs:       HashMap::new(),
+            instance_info:  serde_json::json!({}),
+            machine_config: serde_json::json!({}),
+        });
+    }
 
     let result = async {
         // Socket appears inside the chroot — visible on host at the full path
@@ -246,7 +288,7 @@ async fn run_one(
         // Resources were copied into chroot root; only filenames needed
         let kernel_name = cfg.kernel.file_name().unwrap().to_str().unwrap();
         let rootfs_name = cfg.rootfs.file_name().unwrap().to_str().unwrap();
-        let bench_name  = cfg.bench_disk.file_name().unwrap().to_str().unwrap();
+        let bench_name  = cfg.bench_image(is_file_ops).file_name().unwrap().to_str().unwrap();
 
         client.set_boot_source(
             &format!("/{}", kernel_name),

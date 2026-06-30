@@ -41,6 +41,10 @@ enum BenchMode {
     RandWrite,
     SeqWrite,
     Mixed,
+    /// Metadata stress — creates/stats/reads/unlinks files on a pre-formatted ext4 disk
+    FileOps,
+    /// Drop to an interactive shell on the serial console (for debugging)
+    Shell,
 }
 
 impl BenchMode {
@@ -50,7 +54,17 @@ impl BenchMode {
             BenchMode::RandWrite => "rand_write",
             BenchMode::SeqWrite  => "seq_write",
             BenchMode::Mixed     => "mixed",
+            BenchMode::FileOps   => "file_ops",
+            BenchMode::Shell     => "shell",
         }
+    }
+
+    fn is_file_ops(&self) -> bool {
+        matches!(self, BenchMode::FileOps)
+    }
+
+    fn is_shell(&self) -> bool {
+        matches!(self, BenchMode::Shell)
     }
 }
 
@@ -61,6 +75,8 @@ struct Config {
     kernel:     PathBuf,
     rootfs:     PathBuf,
     bench_disk: PathBuf,
+    /// Pre-formatted ext4 image for file_ops benchmark
+    bench_fs:   PathBuf,
     socket:     PathBuf,
     serial_out: PathBuf,
     fc_log:     PathBuf,
@@ -78,10 +94,16 @@ impl Config {
             kernel,
             rootfs:     base.join("rootfs-baseline.ext4"),
             bench_disk: base.join("bench-disk.raw"),
+            bench_fs:   base.join("bench-fs.ext4"),
             socket:     PathBuf::from("/tmp/fc-bench.socket"),
             serial_out: base.join("serial-output.txt"),
             fc_log:     base.join("fc.log"),
         }
+    }
+
+    /// Return the disk image path for the given benchmark mode
+    fn bench_image(&self, mode: &BenchMode) -> &Path {
+        if mode.is_file_ops() { &self.bench_fs } else { &self.bench_disk }
     }
 }
 
@@ -153,7 +175,23 @@ async fn run_one(
     let _ = fs::remove_file(&cfg.serial_out);
 
     // Start Firecracker
-    let mut fc = start_firecracker(cfg)?;
+    let mut fc = start_firecracker(cfg, mode.is_shell())?;
+
+    if mode.is_shell() {
+        println!("Shell mode: Firecracker PID {} — serial console on terminal", fc.id());
+        let status = fc.wait()?;
+        println!("Firecracker exited with: {}", status);
+        return Ok(BenchResult {
+            mode:         "shell".to_string(),
+            landlock,
+            iteration:     0,
+            total_time_s:   0.0,
+            fio:            serde_json::json!({"shell": "exited"}),
+            fio_logs:       HashMap::new(),
+            instance_info:  serde_json::json!({}),
+            machine_config: serde_json::json!({}),
+        });
+    }
 
     let result = async {
         wait_for_socket(&cfg.socket, Duration::from_secs(5)).await?;
@@ -177,7 +215,7 @@ async fn run_one(
         ).await?;
         client.add_drive(
             "benchdisk",
-            cfg.bench_disk.to_str().unwrap(),
+            cfg.bench_image(mode).to_str().unwrap(),
             false,
             false
         ).await?;
@@ -224,20 +262,25 @@ async fn run_one(
 
 // ── Process management ────────────────────────────────────────────
 
-fn start_firecracker(cfg: &Config) -> Result<Child> {
-    let serial_file = fs::File::create(&cfg.serial_out)?;
-    let log_file    = fs::File::create(&cfg.fc_log)?;
+fn start_firecracker(cfg: &Config, inherit_stdout: bool) -> Result<Child> {
+    let log_file = fs::File::create(&cfg.fc_log)?;
 
-    let child = Command::new(&cfg.fc_binary)
-        .args([
-            "--api-sock", cfg.socket.to_str().unwrap(),
-            "--log-path", cfg.fc_log.to_str().unwrap(),
-            "--level",    "Info",
-        ])
-        .stdout(serial_file)
-        .stderr(log_file)
-        .spawn()?;
+    let mut cmd = Command::new(&cfg.fc_binary);
+    cmd.args([
+        "--api-sock", cfg.socket.to_str().unwrap(),
+        "--log-path", cfg.fc_log.to_str().unwrap(),
+        "--level",    "Info",
+    ])
+    .stderr(log_file);
 
+    if inherit_stdout {
+        cmd.stdout(std::process::Stdio::inherit());
+    } else {
+        let serial_file = fs::File::create(&cfg.serial_out)?;
+        cmd.stdout(serial_file);
+    }
+
+    let child = cmd.spawn()?;
     println!("Firecracker PID: {}", child.id());
     Ok(child)
 }

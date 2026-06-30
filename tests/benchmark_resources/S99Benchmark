@@ -9,10 +9,25 @@ case "$1" in
             case "$param" in
                 benchmark=*)
                     MODE="${param#benchmark=}"
-                    echo "===RESULTS_START==="  > /dev/ttyS0
-                    /root/benchmarks/fio.sh "$MODE"
-                    echo "===RESULTS_END==="    > /dev/ttyS0
-                    poweroff
+                    case "$MODE" in
+                        shell)
+                            echo "=== Dropping to shell (type 'exit' + 'poweroff' to quit) ===" > /dev/ttyS0
+                            /bin/sh < /dev/ttyS0 > /dev/ttyS0 2>&1
+                            poweroff
+                            ;;
+                        file_ops*)
+                            echo "===RESULTS_START==="  > /dev/ttyS0
+                            /root/benchmarks/file_ops.sh ${MODE#file_ops}
+                            echo "===RESULTS_END==="    > /dev/ttyS0
+                            poweroff
+                            ;;
+                        *)
+                            echo "===RESULTS_START==="  > /dev/ttyS0
+                            /root/benchmarks/fio.sh "$MODE"
+                            echo "===RESULTS_END==="    > /dev/ttyS0
+                            poweroff
+                            ;;
+                    esac
                     ;;
             esac
         done
