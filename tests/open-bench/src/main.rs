@@ -1,0 +1,244 @@
+//! Standalone open() syscall microbenchmark.
+//!
+//! Measures the raw cost of the security_file_open / security_path_openat
+//! LSM hook chain under three conditions, with no Firecracker and no VM
+//! in the loop:
+//!
+//!   baseline  - no LSM restriction at all (the floor)
+//!   landlock  - process is landlock_restrict_self()'d before the loop
+//!   chroot    - process is chroot()'d before the loop
+//!
+//! Each subcommand is meant to be invoked as a *fresh process* (not forked
+//! in-process), because chroot() and landlock_restrict_self() are
+//! irreversible for the calling process. Use run_bench.sh to drive all
+//! three conditions and diff the resulting JSON summaries.
+//!
+//! NOTE: swap `setup_landlock()` below for your actual landlock-jailer
+//! ruleset-construction code (the ABI selection and access-rights set
+//! should match exactly what landlock-jailer applies in production, or
+//! this benchmark measures a different ruleset than the one in your
+//! thesis). This version uses a minimal single-directory rule so the
+//! harness is self-contained and compiles standalone.
+
+use clap::{Parser, Subcommand};
+use landlock::{
+    Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
+    RulesetStatus, ABI,
+};
+use nix::unistd::{chdir, chroot};
+use serde::Serialize;
+use std::fs::File;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+#[derive(Parser)]
+#[command(name = "open-bench")]
+struct Cli {
+    #[command(subcommand)]
+    mode: Mode,
+}
+
+#[derive(Subcommand)]
+enum Mode {
+    /// No LSM restriction. This is the control the other two are measured against.
+    Baseline {
+        #[arg(long)]
+        target: PathBuf,
+        #[arg(long, default_value_t = 10_000)]
+        iterations: u32,
+        #[arg(long, default_value_t = 1_000)]
+        warmup: u32,
+        #[arg(long)]
+        raw_out: Option<PathBuf>,
+    },
+    /// Process is landlock_restrict_self()'d before the timed loop.
+    Landlock {
+        #[arg(long)]
+        target: PathBuf,
+        /// Directory the ruleset grants read access under (PathBeneath rule).
+        #[arg(long)]
+        target_dir: PathBuf,
+        #[arg(long, default_value_t = 10_000)]
+        iterations: u32,
+        #[arg(long, default_value_t = 1_000)]
+        warmup: u32,
+        #[arg(long)]
+        raw_out: Option<PathBuf>,
+    },
+    /// Process is chroot()'d before the timed loop.
+    Chroot {
+        #[arg(long)]
+        jail_root: PathBuf,
+        /// Path to open, given as it will resolve *after* chroot (e.g. "/target.bin").
+        #[arg(long)]
+        target_rel: PathBuf,
+        #[arg(long, default_value_t = 10_000)]
+        iterations: u32,
+        #[arg(long, default_value_t = 1_000)]
+        warmup: u32,
+        #[arg(long)]
+        raw_out: Option<PathBuf>,
+    },
+}
+
+#[derive(Serialize)]
+struct BenchSummary {
+    condition: String,
+    iterations: u32,
+    warmup: u32,
+    min_ns: u128,
+    p50_ns: u128,
+    p90_ns: u128,
+    p99_ns: u128,
+    p999_ns: u128,
+    max_ns: u128,
+    mean_ns: f64,
+    stddev_ns: f64,
+}
+
+fn percentile(sorted: &[u128], p: f64) -> u128 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+fn summarize(condition: &str, mut samples: Vec<u128>, iterations: u32, warmup: u32) -> BenchSummary {
+    samples.sort_unstable();
+    let n = samples.len() as f64;
+    let mean = samples.iter().sum::<u128>() as f64 / n;
+    let variance = samples
+        .iter()
+        .map(|&x| {
+            let d = x as f64 - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / n;
+
+    BenchSummary {
+        condition: condition.to_string(),
+        iterations,
+        warmup,
+        min_ns: *samples.first().unwrap_or(&0),
+        p50_ns: percentile(&samples, 0.50),
+        p90_ns: percentile(&samples, 0.90),
+        p99_ns: percentile(&samples, 0.99),
+        p999_ns: percentile(&samples, 0.999),
+        max_ns: *samples.last().unwrap_or(&0),
+        mean_ns: mean,
+        stddev_ns: variance.sqrt(),
+    }
+}
+
+/// Runs the timed open()/close() loop. Warmup iterations happen first and
+/// are discarded, so we're measuring steady-state dentry/page-cache-hot
+/// cost (i.e. the LSM hook's marginal cost), not cold-cache effects.
+fn run_open_loop(target: &Path, iterations: u32, warmup: u32) -> Vec<u128> {
+    for _ in 0..warmup {
+        let _ = File::open(target);
+    }
+
+    let mut samples = Vec::with_capacity(iterations as usize);
+    for _ in 0..iterations {
+        let t0 = Instant::now();
+        let f = File::open(target).expect("open failed inside timed loop");
+        let elapsed = t0.elapsed().as_nanos();
+        drop(f); // close() happens here, inside the measured window on purpose:
+                 // security_file_free / fd teardown cost should be attributed
+                 // to the condition too, since a real openat() call site pays it.
+        samples.push(elapsed);
+    }
+    samples
+}
+
+fn write_raw(path: &Path, samples: &[u128]) -> std::io::Result<()> {
+    let mut f = File::create(path)?;
+    for s in samples {
+        writeln!(f, "{}", s)?;
+    }
+    Ok(())
+}
+
+/// Minimal single-rule ruleset for benchmark purposes.
+/// Replace with your landlock-jailer ruleset-construction call for anything
+/// that needs to match production rule *count*/depth (see idea #5 from the
+/// earlier discussion — rule count is a plausible confound here).
+fn setup_landlock(target_dir: &Path) -> RulesetStatus {
+    // ABI::V3 covers the filesystem-hook path this benchmark exercises
+    // (open/read/write mediation). Bump this to match whatever ABI level
+    // your landlock-jailer targets on 6.17 once your landlock crate
+    // version exposes the higher constant, so the two aren't silently
+    // testing different rule sets.
+    let abi = ABI::V7;
+    let access_all: landlock::BitFlags<AccessFs> = AccessFs::from_all(abi);
+
+    let ruleset = Ruleset::default()
+        .handle_access(access_all)
+        .expect("failed to configure ruleset access")
+        .create()
+        .expect("failed to create ruleset")
+        .add_rule(PathBeneath::new(
+            PathFd::new(target_dir).expect("failed to open target_dir"),
+            AccessFs::ReadDir | AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::RemoveFile,
+        ))
+        .expect("failed to add rule");
+
+    let status = ruleset.restrict_self().expect("restrict_self syscall failed");
+
+    // Matches your existing project rule: NotEnforced is a hard failure,
+    // never a silent fallback.
+    if status.ruleset != RulesetStatus::FullyEnforced {
+        eprintln!("FATAL: landlock ruleset not fully enforced: {:?}", status.ruleset);
+        std::process::exit(1);
+    }
+    status.ruleset
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    let (condition, samples, iterations, warmup, raw_out) = match cli.mode {
+        Mode::Baseline {
+            target,
+            iterations,
+            warmup,
+            raw_out,
+        } => {
+            let samples = run_open_loop(&target, iterations, warmup);
+            ("baseline_unrestricted".to_string(), samples, iterations, warmup, raw_out)
+        }
+        Mode::Landlock {
+            target,
+            target_dir,
+            iterations,
+            warmup,
+            raw_out,
+        } => {
+            setup_landlock(&target_dir);
+            let samples = run_open_loop(&target, iterations, warmup);
+            ("landlock_restricted".to_string(), samples, iterations, warmup, raw_out)
+        }
+        Mode::Chroot {
+            jail_root,
+            target_rel,
+            iterations,
+            warmup,
+            raw_out,
+        } => {
+            chroot(&jail_root).expect("chroot failed - needs CAP_SYS_CHROOT / root");
+            chdir("/").expect("chdir(\"/\") after chroot failed");
+            let samples = run_open_loop(&target_rel, iterations, warmup);
+            ("chroot_restricted".to_string(), samples, iterations, warmup, raw_out)
+        }
+    };
+
+    if let Some(path) = &raw_out {
+        write_raw(path, &samples).expect("failed to write raw samples file");
+    }
+
+    let summary = summarize(&condition, samples, iterations, warmup);
+    println!("{}", serde_json::to_string(&summary).unwrap());
+}
