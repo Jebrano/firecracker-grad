@@ -19,7 +19,19 @@ use vmm_sys_util::syscall::SyscallReturnCode;
 use crate::JailerError;
 use crate::cgroup::{CgroupConfiguration, CgroupConfigurationBuilder};
 use crate::chroot::chroot;
+use crate::landlock_jail::apply_landlock;
 use crate::resource_limits::{FSIZE_ARG, NO_FILE_ARG, ResourceLimits};
+
+/// Which filesystem-isolation backend `Env::run()` should apply. Selected by
+/// `src/bin/jailer.rs` (`Chroot`) or `src/bin/landlock_jailer.rs` (`Landlock`) -- see
+/// `jailer::run()` in lib.rs. Every other step in `run()` (netns join, resource
+/// limits, cgroup setup, daemonization, PID namespace handling) is identical
+/// regardless of which variant is passed, by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Isolation {
+    Chroot,
+    Landlock,
+}
 
 pub const PROC_MOUNTS: &str = "/proc/mounts";
 
@@ -641,10 +653,29 @@ impl Env {
         Ok(())
     }
 
-    pub fn run(mut self) -> Result<(), JailerError> {
-        let exec_file_name = self.copy_exec_to_chroot()?;
-        let chroot_exec_file = PathBuf::from("/").join(exec_file_name);
+    /// Rewrites `--api-sock`'s value to a real, absolute host path under `jail_root`,
+    /// and returns that path's parent directory.
+    ///
+    /// The chroot jailer never needed this: after `pivot_root`, "/" *is* the jail
+    /// root, so Firecracker's default `--api-sock /run/firecracker.socket` already
+    /// lands in the right place. Landlock does no such remapping -- "/" stays the
+    /// real host root for the exec'd process -- so a relative-looking default like
+    /// that would try to bind a socket into the host's actual /run. This rewrites it
+    /// to `jail_root`-relative before exec so it lands where it's supposed to, and
+    /// hands back the parent dir so the caller can create it and grant `MakeSock`
+    /// there via `apply_landlock()`.
+    ///
+    /// Returns `None` if `--api-sock` wasn't passed at all (i.e. the API socket is
+    /// disabled for this VM), in which case no rule is needed.
+    fn build_api_sock_arg(extra_args: &mut [String], jail_root: &Path) -> Option<PathBuf> {
+        let idx = extra_args.iter().position(|a| a == "--api-sock")?;
+        let value = extra_args.get_mut(idx + 1)?;
+        let rewritten = jail_root.join(value.trim_start_matches('/'));
+        *value = rewritten.to_str()?.to_owned();
+        rewritten.parent().map(Path::to_path_buf)
+    }
 
+    pub fn run(mut self, isolation: Isolation) -> Result<(), JailerError> {
         // Join the specified network namespace, if applicable.
         if let Some(ref path) = self.netns {
             Env::join_netns(path)?;
@@ -653,12 +684,16 @@ impl Env {
         // Set limits on resources.
         self.resource_limits.install()?;
 
-        // We have to setup cgroups at this point, because we can't do it anymore after chrooting.
+        // We have to setup cgroups at this point, because the chroot backend can't do
+        // it anymore after chrooting. The Landlock backend has no such constraint, but
+        // we do it here regardless so cgroup setup happens at an identical point in
+        // both binaries -- deliberately, to avoid this ordering becoming a confound in
+        // the benchmark comparison.
         if let Some(ref conf) = self.cgroup_conf {
             conf.setup()?;
         }
 
-        // If daemonization was requested, open /dev/null before chrooting.
+        // If daemonization was requested, open /dev/null before jailing.
         let dev_null = if self.daemonize {
             Some(
                 File::open("/dev/null")
@@ -672,43 +707,74 @@ impl Env {
         #[cfg(target_arch = "aarch64")]
         self.copy_midr_el1_info()?;
 
-        // Jail self.
-        chroot(self.chroot_dir())?;
+        // Jail self. The two backends produce the path that should subsequently be
+        // exec'd: for chroot that's a jail-relative path to the copy of the binary
+        // placed inside the jail; for Landlock it's simply the real, original path to
+        // the binary, since it was never copied anywhere.
+        let exec_target = match isolation {
+            Isolation::Chroot => {
+                let exec_file_name = self.copy_exec_to_chroot()?;
+                let chroot_exec_file = PathBuf::from("/").join(exec_file_name);
 
-        // This will not only create necessary directories, but will also change ownership
-        // for all of them.
-        FOLDER_HIERARCHY
-            .iter()
-            .try_for_each(|f| self.setup_jailed_folder(f))?;
+                chroot(self.chroot_dir())?;
 
-        // Here we are creating the /dev/kvm and /dev/net/tun devices inside the jailer.
-        // Following commands can be translated into bash like this:
-        // $: mkdir -p $chroot_dir/dev/net
-        // $: dev_net_tun_path={$chroot_dir}/"tun"
-        // $: mknod $dev_net_tun_path c 10 200
-        // www.kernel.org/doc/Documentation/networking/tuntap.txt specifies 10 and 200 as the major
-        // and minor for the /dev/net/tun device.
-        self.mknod_and_own_dev(DEV_NET_TUN, DEV_NET_TUN_MAJOR, DEV_NET_TUN_MINOR)?;
-        // Do the same for /dev/kvm with (major, minor) = (10, 232).
-        self.mknod_and_own_dev(DEV_KVM, DEV_KVM_MAJOR, DEV_KVM_MINOR)?;
-        // And for /dev/urandom with (major, minor) = (1, 9).
-        // If the device is not accessible on the host, output a warning to inform user that MMDS
-        // version 2 will not be available to use.
-        let _ = self
-            .mknod_and_own_dev(DEV_URANDOM, DEV_URANDOM_MAJOR, DEV_URANDOM_MINOR)
-            .map_err(|err| {
-                println!(
-                    "Warning! Could not create /dev/urandom device inside jailer: {}.",
-                    err
-                );
-                println!("MMDS version 2 will not be available to use.");
-            });
+                // This will not only create necessary directories, but will also
+                // change ownership for all of them.
+                FOLDER_HIERARCHY
+                    .iter()
+                    .try_for_each(|f| self.setup_jailed_folder(f))?;
 
-        // If we have a minor version for /dev/userfaultfd the device is present on the host.
-        // Expose the device in the jailed environment.
-        if let Some(minor) = self.uffd_dev_minor {
-            self.mknod_and_own_dev(DEV_UFFD_PATH, DEV_UFFD_MAJOR, minor)?;
-        }
+                // Here we are creating the /dev/kvm and /dev/net/tun devices inside
+                // the jailer. Following commands can be translated into bash like
+                // this:
+                // $: mkdir -p $chroot_dir/dev/net
+                // $: dev_net_tun_path={$chroot_dir}/"tun"
+                // $: mknod $dev_net_tun_path c 10 200
+                // www.kernel.org/doc/Documentation/networking/tuntap.txt specifies 10
+                // and 200 as the major and minor for the /dev/net/tun device.
+                self.mknod_and_own_dev(DEV_NET_TUN, DEV_NET_TUN_MAJOR, DEV_NET_TUN_MINOR)?;
+                // Do the same for /dev/kvm with (major, minor) = (10, 232).
+                self.mknod_and_own_dev(DEV_KVM, DEV_KVM_MAJOR, DEV_KVM_MINOR)?;
+                // And for /dev/urandom with (major, minor) = (1, 9).
+                // If the device is not accessible on the host, output a warning to
+                // inform user that MMDS version 2 will not be available to use.
+                let _ = self
+                    .mknod_and_own_dev(DEV_URANDOM, DEV_URANDOM_MAJOR, DEV_URANDOM_MINOR)
+                    .map_err(|err| {
+                        println!(
+                            "Warning! Could not create /dev/urandom device inside jailer: {}.",
+                            err
+                        );
+                        println!("MMDS version 2 will not be available to use.");
+                    });
+
+                // If we have a minor version for /dev/userfaultfd the device is
+                // present on the host. Expose the device in the jailed environment.
+                if let Some(minor) = self.uffd_dev_minor {
+                    self.mknod_and_own_dev(DEV_UFFD_PATH, DEV_UFFD_MAJOR, minor)?;
+                }
+
+                chroot_exec_file
+            }
+            Isolation::Landlock => {
+                // The API socket's parent dir needs to exist before we can open an fd
+                // on it for the MakeSock rule below -- with chroot this came for free
+                // from FOLDER_HIERARCHY, since the jail root itself was freshly
+                // created. Nothing else from FOLDER_HIERARCHY is needed: there's no
+                // /dev to populate (the real /dev/kvm and /dev/net/tun are used
+                // directly) and no jail root ownership to fix up (Landlock doesn't
+                // care who owns the directory it's granting access to).
+                let api_sock_dir = Self::build_api_sock_arg(&mut self.extra_args, &self.chroot_dir);
+                if let Some(ref dir) = api_sock_dir {
+                    fs::create_dir_all(dir)
+                        .map_err(|err| JailerError::CreateDir(dir.clone(), err))?;
+                }
+
+                apply_landlock(&self.chroot_dir, &self.exec_file_path, api_sock_dir.as_deref())?;
+
+                self.exec_file_path.clone()
+            }
+        };
 
         self.jailer_cpu_time_us = get_time_us(ClockType::ProcessCpu) - self.start_time_cpu_us;
 
@@ -767,10 +833,10 @@ impl Env {
 
         // If specified, exec the provided binary into a new PID namespace.
         if self.new_pid_ns {
-            self.exec_into_new_pid_ns(chroot_exec_file)
+            self.exec_into_new_pid_ns(exec_target)
         } else {
-            self.save_exec_file_pid(id().try_into().unwrap(), chroot_exec_file.clone())?;
-            Err(JailerError::Exec(self.exec_command(chroot_exec_file)))
+            self.save_exec_file_pid(id().try_into().unwrap(), exec_target.clone())?;
+            Err(JailerError::Exec(self.exec_command(exec_target)))
         }
     }
 }

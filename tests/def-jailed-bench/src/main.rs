@@ -98,7 +98,7 @@ impl BenchMode {
         matches!(self, BenchMode::FileOps)
     }
 
-    fn is_shell(&self) -> bool {
+    fn _is_shell(&self) -> bool {
         matches!(self, BenchMode::Shell)
     }
 }

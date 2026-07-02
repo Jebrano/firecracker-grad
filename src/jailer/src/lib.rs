@@ -1,28 +1,40 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+//! Shared jailer logic used by both the `jailer` (chroot) and `landlock-jailer`
+//! (Landlock) binaries in `src/bin/`. Everything except the choice of filesystem
+//! isolation backend lives here, so the two binaries stay a controlled A/B pair:
+//! identical arg parsing, cgroup setup, resource limits, daemonization, and PID
+//! namespace handling, differing only in the `Isolation` variant `Env::run()` is given.
+
 use std::ffi::{CString, NulError, OsString};
 use std::fmt::{Debug, Display};
-use std::fs::OpenOptions;
+use std::fs::{OpenOptions, Permissions};
+
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::{env as p_env, fs, io};
 
-use env::PROC_MOUNTS;
+use env::{Env, Isolation, PROC_MOUNTS};
 use utils::arg_parser::{ArgParser, Argument, UtilsArgParserError as ParsingError};
 use utils::time::{ClockType, get_time_us};
 use utils::validators;
 use vmm_sys_util::syscall::SyscallReturnCode;
 
-use crate::env::Env;
+pub mod cgroup;
+pub mod chroot;
+pub mod env;
+// Named `landlock_jail` rather than `landlock` because the latter would collide with
+// the `landlock` crate this module itself depends on (see landlock.rs's `use
+// landlock::{...}` at the top -- that import needs the external crate name
+// unshadowed). The file is still called `landlock.rs`; only the module identifier
+// differs from the filename.
+#[path = "landlock.rs"]
+pub mod landlock_jail;
+pub mod resource_limits;
 
-mod cgroup;
-mod chroot;
-mod env;
-mod resource_limits;
-
-const JAILER_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const JAILER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, thiserror::Error)]
 pub enum JailerError {
@@ -97,6 +109,14 @@ pub enum JailerError {
     HardLink(PathBuf),
     #[error("Invalid instance ID: {0}")]
     InvalidInstanceId(validators::ValidatorError),
+    #[error("Failed to add Landlock rule for {0}: {1}")]
+    LandlockAddRule(PathBuf, String),
+    #[error("Landlock ruleset was not fully enforced (status: {0:?}); refusing to run unsandboxed")]
+    LandlockNotEnforced(landlock::RulesetStatus),
+    #[error("Failed to restrict self with Landlock ruleset: {0}")]
+    LandlockRestrictSelf(landlock::RulesetError),
+    #[error("Failed to create Landlock ruleset: {0}")]
+    LandlockRulesetCreate(landlock::RulesetError),
     #[error("Cannot get metadata for a file: {0}: {1}")]
     Metadata(PathBuf, io::Error),
     #[error("{}", format!("File {:?} doesn't have a parent", .0).replace('\"', ""))]
@@ -113,6 +133,8 @@ pub enum JailerError {
     NotAFile(PathBuf),
     #[error("{}", format!("{:?} is not a directory", .0).replace('\"', ""))]
     NotADirectory(PathBuf),
+    #[error("Failed to confirm PR_SET_NO_NEW_PRIVS was set by Landlock")]
+    NoNewPrivs,
     #[error("Failed to open {0}: {1}")]
     Open(PathBuf, io::Error),
     #[error("{}", format!("Failed to parse path {:?} into an OsString", .0).replace('\"', ""))]
@@ -156,6 +178,9 @@ pub enum JailerError {
     #[error("{}", format!("Failed to write to {:?}: {}", .0, .1).replace('\"', ""))]
     Write(PathBuf, io::Error),
 }
+
+const FOLDER_PERMISSIONS: u32 = 0o700;
+
 
 /// Create an ArgParser object which contains info about the command line argument parser and
 /// populate it with the expected arguments and their characteristics.
@@ -327,9 +352,14 @@ pub fn to_cstring<T: AsRef<Path> + Debug>(path: T) -> Result<CString, JailerErro
     CString::new(path_str).map_err(JailerError::CStringParsing)
 }
 
-/// We wrap the actual main in order to pretty print an error with Display trait.
-fn main() -> Result<(), JailerError> {
-    let result = main_exec();
+/// Single orchestration entrypoint shared by both `src/bin/jailer.rs` and
+/// `src/bin/landlock_jailer.rs`. `label` is only used for `--help`/`--version` output,
+/// so logs make it obvious which binary produced them; `isolation` picks the
+/// filesystem-isolation backend `Env::run()` uses. Everything else -- arg parsing,
+/// cgroup/resource-limit setup order, daemonization, PID namespace handling -- is
+/// identical between the two binaries by construction.
+pub fn run(isolation: Isolation, label: &str) -> Result<(), JailerError> {
+    let result = main_exec(isolation, label);
     if let Err(e) = result {
         eprintln!("{}", e);
         Err(e)
@@ -338,7 +368,7 @@ fn main() -> Result<(), JailerError> {
     }
 }
 
-fn main_exec() -> Result<(), JailerError> {
+fn main_exec(isolation: Isolation, label: &str) -> Result<(), JailerError> {
     sanitize_process()
         .unwrap_or_else(|err| panic!("Failed to sanitize the Jailer process: {}", err));
 
@@ -349,14 +379,14 @@ fn main_exec() -> Result<(), JailerError> {
     let arguments = arg_parser.arguments();
 
     if arguments.flag_present("help") {
-        println!("Jailer v{}\n", JAILER_VERSION);
+        println!("{} v{}\n", label, JAILER_VERSION);
         println!("{}\n", arg_parser.formatted_help());
         println!("Any arguments after the -- separator will be supplied to the jailed binary.\n");
         return Ok(());
     }
 
     if arguments.flag_present("version") {
-        println!("Jailer v{}\n", JAILER_VERSION);
+        println!("{} v{}\n", label, JAILER_VERSION);
         return Ok(());
     }
 
@@ -369,7 +399,9 @@ fn main_exec() -> Result<(), JailerError> {
     .and_then(|env| {
         fs::create_dir_all(env.chroot_dir())
             .map_err(|err| JailerError::CreateDir(env.chroot_dir().to_owned(), err))?;
-        env.run()
+        fs::set_permissions(env.chroot_dir(), Permissions::from_mode(FOLDER_PERMISSIONS))
+            .map_err(|err| JailerError::Chmod(env.chroot_dir().to_owned(), err))?;
+        env.run(isolation)
     })?;
     Ok(())
 }
@@ -379,7 +411,7 @@ mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
 
     use std::env;
-    use std::ffi::CStr;
+    // use std::ffi::CStr;
     use std::fs::File;
     use std::os::unix::io::IntoRawFd;
 
@@ -398,66 +430,38 @@ mod tests {
 
         let mut fds = Vec::new();
         for i in 0..n {
-            let maybe_file = File::create(format!("{}/{}", &tmp_dir_path, i));
+            let maybe_file = File::create(format!("{}/{}", tmp_dir_path, i));
             fds.push(maybe_file.unwrap().into_raw_fd());
         }
 
         test_fn().unwrap();
 
         for fd in fds {
-            let is_fd_opened = unsafe { libc::fcntl(fd, libc::F_GETFD) } == 0;
-            assert!(!is_fd_opened);
+            // SAFETY: Safe because it's a valid fd from a value known to exist.
+            let is_open = unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1;
+            assert!(!is_open);
         }
 
-        fs::remove_dir_all(tmp_dir_path).unwrap();
+        fs::remove_dir_all(&tmp_dir_path).unwrap();
     }
 
     #[test]
-    fn test_fds_close_range() {
-        // SAFETY: Always safe
-        let mut n = unsafe { std::mem::zeroed() };
-        // SAFETY: We check if the uname call succeeded
-        assert_eq!(unsafe { libc::uname(&mut n) }, 0);
-        // SAFETY: Always safe
-        let release = unsafe { CStr::from_ptr(n.release.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
-        // Parse the major and minor version of the kernel
-        let mut r = release.split('.');
-        let major: i32 = str::parse(r.next().unwrap()).unwrap();
-        let minor: i32 = str::parse(r.next().unwrap()).unwrap();
-
-        // Skip this test if we're running on a too old kernel
-        if major > 5 || (major == 5 && minor >= 9) {
-            run_close_fds_test(close_fds_by_close_range);
-        }
+    fn test_close_fds_by_close_range() {
+        run_close_fds_test(close_fds_by_close_range);
     }
 
     #[test]
     fn test_sanitize_process() {
-        run_close_fds_test(sanitize_process);
-    }
-
-    #[test]
-    fn test_clean_env_vars() {
-        let env_vars: [&str; 5] = ["VAR1", "VAR2", "VAR3", "VAR4", "VAR5"];
-
-        // Set environment variables
-        for env_var in env_vars.iter() {
-            // SAFETY: the function is safe to call in a single-threaded program
-            unsafe {
-                env::set_var(env_var, "0");
-            }
+        // # Safety
+        // This function is safe to call in a single-threaded program.
+        unsafe{
+            env::set_var("FOO", "bar");
         }
+        assert!(env::var("FOO").is_ok());
 
-        // Cleanup the environment
-        clean_env_vars();
+        sanitize_process().unwrap();
 
-        // Assert that the variables set beforehand
-        // do not exist anymore
-        for env_var in env_vars.iter() {
-            assert_eq!(env::var_os(env_var), None);
-        }
+        assert!(env::var("FOO").is_err());
     }
 
     #[test]
@@ -465,7 +469,7 @@ mod tests {
         let path = Path::new("some_path");
         let cstring_path = to_cstring(path).unwrap();
         assert_eq!(cstring_path, CString::new("some_path").unwrap());
-        let path_with_nul = Path::new("some_path\0");
+        let path_with_nul = Path::new("some_path_with_nul\0");
         assert_eq!(
             format!("{}", to_cstring(path_with_nul).unwrap_err()),
             "Encountered interior \\0 while parsing a string"

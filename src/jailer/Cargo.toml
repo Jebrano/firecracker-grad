@@ -7,15 +7,27 @@ description = "Process for starting Firecracker in production scenarios; applies
 homepage = "https://firecracker-microvm.github.io/"
 license = "Apache-2.0"
 
+[lib]
+name = "jailer"
+path = "src/lib.rs"
+
 [[bin]]
 name = "jailer"
+path = "src/bin/jailer.rs"
 bench = false
+
+[[bin]]
+name = "landlock-jailer"
+path = "src/bin/landlock_jailer.rs"
+bench = false
+
 
 [features]
 tracing = ["log-instrument", "utils/tracing"]
 
 [dependencies]
 libc = "0.2.186"
+landlock = "0.4.5"
 log-instrument = { path = "../log-instrument", optional = true }
 regex = { version = "1.12.3", default-features = false, features = ["std"] }
 thiserror = "2.0.18"
