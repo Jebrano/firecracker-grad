@@ -31,6 +31,9 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use std::ffi::CString;
+use std::os::unix::io::RawFd;
+
 
 #[derive(Parser)]
 #[command(name = "open-bench")]
@@ -41,10 +44,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Mode {
-    /// No LSM restriction. This is the control the other two are measured against.
+    /// No LSM restriction — control group.
     Baseline {
         #[arg(long)]
-        target: PathBuf,
+        target_dir: PathBuf,
+        #[arg(long)]
+        target_name: String,
         #[arg(long, default_value_t = 10_000)]
         iterations: u32,
         #[arg(long, default_value_t = 1_000)]
@@ -52,13 +57,14 @@ enum Mode {
         #[arg(long)]
         raw_out: Option<PathBuf>,
     },
-    /// Process is landlock_restrict_self()'d before the timed loop.
+    /// landlock_restrict_self() before the loop.
     Landlock {
         #[arg(long)]
-        target: PathBuf,
-        /// Directory the ruleset grants read access under (PathBeneath rule).
-        #[arg(long)]
         target_dir: PathBuf,
+        #[arg(long)]
+        target_name: String,
+        #[arg(long)]
+        allow_root: PathBuf,
         #[arg(long, default_value_t = 10_000)]
         iterations: u32,
         #[arg(long, default_value_t = 1_000)]
@@ -66,13 +72,12 @@ enum Mode {
         #[arg(long)]
         raw_out: Option<PathBuf>,
     },
-    /// Process is chroot()'d before the timed loop.
+    /// chroot() before the loop.
     Chroot {
         #[arg(long)]
         jail_root: PathBuf,
-        /// Path to open, given as it will resolve *after* chroot (e.g. "/target.bin").
         #[arg(long)]
-        target_rel: PathBuf,
+        target_name: String,
         #[arg(long, default_value_t = 10_000)]
         iterations: u32,
         #[arg(long, default_value_t = 1_000)]
@@ -81,6 +86,7 @@ enum Mode {
         raw_out: Option<PathBuf>,
     },
 }
+
 
 #[derive(Serialize)]
 struct BenchSummary {
@@ -136,23 +142,34 @@ fn summarize(condition: &str, mut samples: Vec<u128>, iterations: u32, warmup: u
 /// Runs the timed open()/close() loop. Warmup iterations happen first and
 /// are discarded, so we're measuring steady-state dentry/page-cache-hot
 /// cost (i.e. the LSM hook's marginal cost), not cold-cache effects.
-fn run_open_loop(target: &Path, iterations: u32, warmup: u32) -> Vec<u128> {
+/// Open dir_fd BEFORE calling this. All configs use the same fd + name
+/// so the VFS dentry walk is identical; only the LSM hooks differ.
+fn run_openat_loop(dir_fd: RawFd, name: &str, iterations: u32, warmup: u32) -> Vec<u128> {
+    let c_name = CString::new(name).expect("target_name contains null byte");
+
+    // warmup — prime caches
     for _ in 0..warmup {
-        let _ = File::open(target);
+        // SAFETY: dir_fd is a valid O_DIRECTORY fd, c_name is valid.
+        let fd = unsafe { libc::openat(dir_fd, c_name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
     }
 
     let mut samples = Vec::with_capacity(iterations as usize);
     for _ in 0..iterations {
         let t0 = Instant::now();
-        let f = File::open(target).expect("open failed inside timed loop");
+        // SAFETY: same as above.
+        let fd = unsafe { libc::openat(dir_fd, c_name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         let elapsed = t0.elapsed().as_nanos();
-        drop(f); // close() happens here, inside the measured window on purpose:
-                 // security_file_free / fd teardown cost should be attributed
-                 // to the condition too, since a real openat() call site pays it.
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
         samples.push(elapsed);
     }
     samples
 }
+
 
 fn write_raw(path: &Path, samples: &[u128]) -> std::io::Result<()> {
     let mut f = File::create(path)?;
@@ -166,7 +183,7 @@ fn write_raw(path: &Path, samples: &[u128]) -> std::io::Result<()> {
 /// Replace with your landlock-jailer ruleset-construction call for anything
 /// that needs to match production rule *count*/depth (see idea #5 from the
 /// earlier discussion — rule count is a plausible confound here).
-fn setup_landlock(target_dir: &Path) -> RulesetStatus {
+fn setup_landlock(allow_root: &Path) -> RulesetStatus {
     // ABI::V3 covers the filesystem-hook path this benchmark exercises
     // (open/read/write mediation). Bump this to match whatever ABI level
     // your landlock-jailer targets on 6.17 once your landlock crate
@@ -181,10 +198,11 @@ fn setup_landlock(target_dir: &Path) -> RulesetStatus {
         .create()
         .expect("failed to create ruleset")
         .add_rule(PathBeneath::new(
-            PathFd::new(target_dir).expect("failed to open target_dir"),
-            AccessFs::ReadDir | AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::RemoveFile,
+            PathFd::new(allow_root).expect("failed to open allow_root"),
+            AccessFs::ReadDir | AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::RemoveFile | AccessFs::MakeReg,
         ))
-        .expect("failed to add rule");
+        .expect("failed to add rule for allow_root")
+        .log_new_exec(true).expect("can't log");
 
     let status = ruleset.restrict_self().expect("restrict_self syscall failed");
 
@@ -201,39 +219,56 @@ fn main() {
     let cli = Cli::parse();
 
     let (condition, samples, iterations, warmup, raw_out) = match cli.mode {
-        Mode::Baseline {
-            target,
-            iterations,
-            warmup,
-            raw_out,
-        } => {
-            let samples = run_open_loop(&target, iterations, warmup);
+        Mode::Baseline { target_dir, target_name, iterations, warmup, raw_out } => {
+            // Open dir_fd BEFORE any restriction (none here, but kept symmetric).
+            let dir_cstr = CString::new(
+                target_dir.as_os_str().as_encoded_bytes()
+            ).expect("target_dir contains null");
+            // SAFETY: valid path, standard flags.
+            let dir_fd = unsafe {
+                libc::open(dir_cstr.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            };
+            assert!(dir_fd >= 0, "open target_dir failed");
+
+            let samples = run_openat_loop(dir_fd, &target_name, iterations, warmup);
             ("baseline_unrestricted".to_string(), samples, iterations, warmup, raw_out)
         }
-        Mode::Landlock {
-            target,
-            target_dir,
-            iterations,
-            warmup,
-            raw_out,
-        } => {
-            setup_landlock(&target_dir);
-            let samples = run_open_loop(&target, iterations, warmup);
+        Mode::Landlock { target_dir, target_name, allow_root, iterations, warmup, raw_out } => {
+            // Open dir_fd BEFORE landlock restriction.
+            let dir_cstr = CString::new(
+                target_dir.as_os_str().as_encoded_bytes()
+            ).expect("target_dir contains null");
+            let dir_fd = unsafe {
+                libc::open(dir_cstr.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            };
+            assert!(dir_fd >= 0, "open target_dir failed");
+
+            // Now apply Landlock — dir_fd remains usable (opened pre-restriction).
+            setup_landlock(&allow_root);
+
+            let samples = run_openat_loop(dir_fd, &target_name, iterations, warmup);
             ("landlock_restricted".to_string(), samples, iterations, warmup, raw_out)
         }
-        Mode::Chroot {
-            jail_root,
-            target_rel,
-            iterations,
-            warmup,
-            raw_out,
-        } => {
+        Mode::Chroot { jail_root, target_name, iterations, warmup, raw_out } => {
+            // Open dir_fd pointing at the jail BEFORE chroot.
+            let dir_cstr = CString::new(
+                jail_root.as_os_str().as_encoded_bytes()
+            ).expect("jail_root contains null");
+            let dir_fd = unsafe {
+                libc::open(dir_cstr.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            };
+            assert!(dir_fd >= 0, "open jail_root failed");
+
             chroot(&jail_root).expect("chroot failed - needs CAP_SYS_CHROOT / root");
             chdir("/").expect("chdir(\"/\") after chroot failed");
-            let samples = run_open_loop(&target_rel, iterations, warmup);
+
+            // dir_fd is still valid — it was opened before chroot.
+            let samples = run_openat_loop(dir_fd, &target_name, iterations, warmup);
             ("chroot_restricted".to_string(), samples, iterations, warmup, raw_out)
         }
     };
+    // ... rest unchanged (write_raw, summarize, println)
+
 
     if let Some(path) = &raw_out {
         write_raw(path, &samples).expect("failed to write raw samples file");

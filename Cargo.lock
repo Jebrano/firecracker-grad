@@ -1274,6 +1274,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "landlock",
+ "libc",
  "nix 0.31.3",
  "serde",
  "serde_json",

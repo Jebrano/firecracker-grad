@@ -12,7 +12,7 @@ set -euo pipefail
 ITERATIONS="${1:-20000}"
 WARMUP="${2:-2000}"
 CORE_RANGE="2-3"          # matches your existing taskset convention
-BIN="./target/release/open-bench"
+BIN="./target/release/open-bench" # We need to change this
 WORKDIR="$(mktemp -d /tmp/open-bench.XXXXXX)"
 OUT="results.jsonl"
 
@@ -45,31 +45,31 @@ cp "$WORKDIR/allowed/target.bin" "$WORKDIR/jail/target.bin"
 # emptying out result.json
 : > "$OUT"
 
-# --- baseline -------------------------------------------------------------
-echo "[*] running baseline"
+# --- baseline ---
 taskset -c "$CORE_RANGE" "$BIN" baseline \
-  --target "$WORKDIR/allowed/target.bin" \
+  --target-dir "$WORKDIR/allowed" \
+  --target-name target.bin \
   --iterations "$ITERATIONS" --warmup "$WARMUP" \
-  --raw-out "$WORKDIR/baseline_raw.txt" \
+  --raw-out "$WORKDIR/allowed/baseline_raw.txt" \
   >> "$OUT"
 
-# --- landlock ---------------------------------------------------------
-echo "[*] running landlock"
+# --- landlock ---
 sudo taskset -c "$CORE_RANGE" "$BIN" landlock \
-  --target "$WORKDIR/allowed/target.bin" \
+  --target-dir "$WORKDIR/allowed" \
+  --target-name target.bin \
   --allow-root "$WORKDIR/allowed" \
   --iterations "$ITERATIONS" --warmup "$WARMUP" \
-  --raw-out "$WORKDIR/landlock_raw.txt" \
+  --raw-out "$WORKDIR/allowed/landlock_raw.txt" \
   >> "$OUT"
 
-# --- chroot -------------------------------------------------------------
-echo "[*] running chroot"
+# --- chroot ---
 sudo taskset -c "$CORE_RANGE" "$BIN" chroot \
   --jail-root "$WORKDIR/jail" \
-  --target-rel /target.bin \
+  --target-name target.bin \
   --iterations "$ITERATIONS" --warmup "$WARMUP" \
-  --raw-out "$WORKDIR/chroot_raw.txt" \
+  --raw-out /chroot_raw.txt \
   >> "$OUT"
+
 
 echo "[*] done. summaries in $OUT, raw samples in $WORKDIR"
 echo
@@ -78,11 +78,13 @@ cat "$OUT" | python3 -m json.tool --compact 2>/dev/null || cat "$OUT"
 # --- optional: attribute cost to the LSM hook specifically ----------------
 # Uncomment to also capture perf counters for the landlock condition.
 # Requires perf and the security_file_open tracepoint to exist on 6.17.
+# Don't forget to add it to probe `sudo perf probe --add security_file_open`
 #
 echo "[*] perf stat pass (landlock)"
-sudo perf stat -e security_file_open,security_path_openat \
+sudo perf stat -e probe:security_file_open \
   taskset -c "$CORE_RANGE" "$BIN" landlock \
-    --target "$WORKDIR/allowed/target.bin" \
+    --target-dir "$WORKDIR/allowed" \
+    --target-name target.bin \
     --allow-root "$WORKDIR/allowed" \
     --iterations "$ITERATIONS" --warmup "$WARMUP" \
     > /dev/null
