@@ -27,7 +27,6 @@ use landlock::{
 };
 use nix::unistd::{chdir, chroot};
 use serde::Serialize;
-use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -56,6 +55,10 @@ enum Mode {
         warmup: u32,
         #[arg(long)]
         raw_out: Option<PathBuf>,
+        /// Append to raw_out instead of truncating (for pooling samples
+        /// across interleaved cycles into one file).
+        #[arg(long, default_value_t = false)]
+        raw_append: bool,
     },
     /// landlock_restrict_self() before the loop.
     Landlock {
@@ -71,6 +74,8 @@ enum Mode {
         warmup: u32,
         #[arg(long)]
         raw_out: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        raw_append: bool,
     },
     /// chroot() before the loop.
     Chroot {
@@ -84,6 +89,24 @@ enum Mode {
         warmup: u32,
         #[arg(long)]
         raw_out: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        raw_append: bool,
+    },
+    /// Mann-Whitney U test between two raw sample files (one ns value per line).
+    /// Uses the normal approximation with tie correction, which is standard
+    /// and accurate at the sample sizes this harness produces (thousands+).
+    Analyze {
+        #[arg(long)]
+        a: PathBuf,
+        #[arg(long, default_value = "A")]
+        a_label: String,
+        #[arg(long)]
+        b: PathBuf,
+        #[arg(long, default_value = "B")]
+        b_label: String,
+        /// Significance level for the verdict line.
+        #[arg(long, default_value_t = 0.05)]
+        alpha: f64,
     },
 }
 
@@ -171,8 +194,15 @@ fn run_openat_loop(dir_fd: RawFd, name: &str, iterations: u32, warmup: u32) -> V
 }
 
 
-fn write_raw(path: &Path, samples: &[u128]) -> std::io::Result<()> {
-    let mut f = File::create(path)?;
+fn write_raw(path: &Path, samples: &[u128], append: bool) -> std::io::Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true);
+    if append {
+        opts.append(true);
+    } else {
+        opts.truncate(true);
+    }
+    let mut f = opts.open(path)?;
     for s in samples {
         writeln!(f, "{}", s)?;
     }
@@ -218,8 +248,15 @@ fn setup_landlock(allow_root: &Path) -> RulesetStatus {
 fn main() {
     let cli = Cli::parse();
 
-    let (condition, samples, iterations, warmup, raw_out) = match cli.mode {
-        Mode::Baseline { target_dir, target_name, iterations, warmup, raw_out } => {
+    // Analyze doesn't produce timing samples of its own, so it's handled
+    // separately from the three benchmark conditions below.
+    if let Mode::Analyze { a, a_label, b, b_label, alpha } = cli.mode {
+        run_analyze(&a, &a_label, &b, &b_label, alpha);
+        return;
+    }
+
+    let (condition, samples, iterations, warmup, raw_out, raw_append) = match cli.mode {
+        Mode::Baseline { target_dir, target_name, iterations, warmup, raw_out, raw_append } => {
             // Open dir_fd BEFORE any restriction (none here, but kept symmetric).
             let dir_cstr = CString::new(
                 target_dir.as_os_str().as_encoded_bytes()
@@ -231,9 +268,9 @@ fn main() {
             assert!(dir_fd >= 0, "open target_dir failed");
 
             let samples = run_openat_loop(dir_fd, &target_name, iterations, warmup);
-            ("baseline_unrestricted".to_string(), samples, iterations, warmup, raw_out)
+            ("baseline_unrestricted".to_string(), samples, iterations, warmup, raw_out, raw_append)
         }
-        Mode::Landlock { target_dir, target_name, allow_root, iterations, warmup, raw_out } => {
+        Mode::Landlock { target_dir, target_name, allow_root, iterations, warmup, raw_out, raw_append } => {
             // Open dir_fd BEFORE landlock restriction.
             let dir_cstr = CString::new(
                 target_dir.as_os_str().as_encoded_bytes()
@@ -247,9 +284,9 @@ fn main() {
             setup_landlock(&allow_root);
 
             let samples = run_openat_loop(dir_fd, &target_name, iterations, warmup);
-            ("landlock_restricted".to_string(), samples, iterations, warmup, raw_out)
+            ("landlock_restricted".to_string(), samples, iterations, warmup, raw_out, raw_append)
         }
-        Mode::Chroot { jail_root, target_name, iterations, warmup, raw_out } => {
+        Mode::Chroot { jail_root, target_name, iterations, warmup, raw_out, raw_append } => {
             // Open dir_fd pointing at the jail BEFORE chroot.
             let dir_cstr = CString::new(
                 jail_root.as_os_str().as_encoded_bytes()
@@ -264,16 +301,189 @@ fn main() {
 
             // dir_fd is still valid — it was opened before chroot.
             let samples = run_openat_loop(dir_fd, &target_name, iterations, warmup);
-            ("chroot_restricted".to_string(), samples, iterations, warmup, raw_out)
+            ("chroot_restricted".to_string(), samples, iterations, warmup, raw_out, raw_append)
         }
+        Mode::Analyze { .. } => unreachable!("handled above"),
     };
-    // ... rest unchanged (write_raw, summarize, println)
-
 
     if let Some(path) = &raw_out {
-        write_raw(path, &samples).expect("failed to write raw samples file");
+        write_raw(path, &samples, raw_append).expect("failed to write raw samples file");
     }
 
     let summary = summarize(&condition, samples, iterations, warmup);
     println!("{}", serde_json::to_string(&summary).unwrap());
+}
+
+// ---------------------------------------------------------------------
+// Mann-Whitney U (Wilcoxon rank-sum), normal approximation with tie
+// correction. Valid at the sample sizes this harness produces (n well
+// into the thousands); the normal approximation to the U distribution
+// is standard practice at that scale and doesn't require an exact-U
+// table or an external stats crate.
+// ---------------------------------------------------------------------
+
+struct MannWhitneyResult {
+    n1: usize,
+    n2: usize,
+    u1: f64,
+    z: f64,
+    p_two_tailed: f64,
+    /// Vargha-Delaney A: P(a random sample from A > a random sample from
+    /// B), with ties counted as half a win. 0.5 = no effect, further from
+    /// 0.5 = larger effect. Read as "probability of superiority."
+    prob_a_gt_b: f64,
+}
+
+fn read_samples(path: &Path) -> Vec<f64> {
+    let content = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.trim().parse::<f64>().unwrap_or_else(|e| panic!("bad sample line {:?}: {}", l, e)))
+        .collect()
+}
+
+/// Standard normal CDF via the Abramowitz-Stegun erf approximation
+/// (max error ~1.5e-7), avoiding a dependency on an external stats crate.
+fn normal_cdf(x: f64) -> f64 {
+    0.5 * (1.0 + erf(x / std::f64::consts::SQRT_2))
+}
+
+fn erf(x: f64) -> f64 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let a1 = 0.254829592;
+    let a2 = -0.284496736;
+    let a3 = 1.421413741;
+    let a4 = -1.453152027;
+    let a5 = 1.061405429;
+    let p = 0.3275911;
+    let t = 1.0 / (1.0 + p * x);
+    let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-x * x).exp();
+    sign * y
+}
+
+fn mann_whitney_u(a: &[f64], b: &[f64]) -> MannWhitneyResult {
+    let n1 = a.len();
+    let n2 = b.len();
+    assert!(n1 > 0 && n2 > 0, "both samples must be non-empty");
+
+    let mut combined: Vec<(f64, u8)> = a.iter().map(|&v| (v, 0u8))
+        .chain(b.iter().map(|&v| (v, 1u8)))
+        .collect();
+    combined.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
+
+    // Assign average rank to tied values.
+    let n = combined.len();
+    let mut ranks = vec![0.0f64; n];
+    let mut i = 0;
+    let mut tie_term_sum = 0.0f64; // sum of (t^3 - t) over tie groups, for variance correction
+    while i < n {
+        let mut j = i + 1;
+        while j < n && combined[j].0 == combined[i].0 {
+            j += 1;
+        }
+        let tie_count = (j - i) as f64;
+        // Ranks are 1-indexed; average rank across the tied block.
+        let avg_rank = ((i + 1) as f64 + j as f64) / 2.0;
+        for k in i..j {
+            ranks[k] = avg_rank;
+        }
+        if tie_count > 1.0 {
+            tie_term_sum += tie_count.powi(3) - tie_count;
+        }
+        i = j;
+    }
+
+    let r1: f64 = (0..n).filter(|&k| combined[k].1 == 0).map(|k| ranks[k]).sum();
+
+    let n1f = n1 as f64;
+    let n2f = n2 as f64;
+    let u1 = r1 - n1f * (n1f + 1.0) / 2.0;
+
+    let mean_u = n1f * n2f / 2.0;
+    let nf = n1f + n2f;
+    let sigma_u = (n1f * n2f / 12.0 * ((nf + 1.0) - tie_term_sum / (nf * (nf - 1.0)))).sqrt();
+
+    // Continuity correction: move U1 half a step toward the mean before
+    // standardizing.
+    let cc = if u1 > mean_u { -0.5 } else { 0.5 };
+    let z = if sigma_u > 0.0 { (u1 - mean_u + cc) / sigma_u } else { 0.0 };
+    let p_two_tailed = 2.0 * (1.0 - normal_cdf(z.abs()));
+
+    MannWhitneyResult {
+        n1,
+        n2,
+        u1,
+        z,
+        p_two_tailed,
+        prob_a_gt_b: u1 / (n1f * n2f),
+    }
+}
+
+fn run_analyze(a_path: &Path, a_label: &str, b_path: &Path, b_label: &str, alpha: f64) {
+    let a = read_samples(a_path);
+    let b = read_samples(b_path);
+
+    let median = |v: &[f64]| -> f64 {
+        let mut s = v.to_vec();
+        s.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let n = s.len();
+        if n % 2 == 0 {
+            (s[n / 2 - 1] + s[n / 2]) / 2.0
+        } else {
+            s[n / 2]
+        }
+    };
+    let mean = |v: &[f64]| -> f64 { v.iter().sum::<f64>() / v.len() as f64 };
+
+    let result = mann_whitney_u(&a, &b);
+
+    let verdict = if result.p_two_tailed < alpha {
+        format!(
+            "SIGNIFICANT at alpha={alpha}: {a_label} and {b_label} differ (p={:.2e})",
+            result.p_two_tailed
+        )
+    } else {
+        format!(
+            "NOT significant at alpha={alpha}: no evidence {a_label} and {b_label} differ (p={:.2e})",
+            result.p_two_tailed
+        )
+    };
+
+    #[derive(Serialize)]
+    struct AnalyzeOutput {
+        a_label: String,
+        b_label: String,
+        n_a: usize,
+        n_b: usize,
+        a_median_ns: f64,
+        b_median_ns: f64,
+        a_mean_ns: f64,
+        b_mean_ns: f64,
+        u_statistic: f64,
+        z_score: f64,
+        p_value_two_tailed: f64,
+        prob_a_greater_than_b: f64,
+        verdict: String,
+    }
+
+    let out = AnalyzeOutput {
+        a_label: a_label.to_string(),
+        b_label: b_label.to_string(),
+        n_a: result.n1,
+        n_b: result.n2,
+        a_median_ns: median(&a),
+        b_median_ns: median(&b),
+        a_mean_ns: mean(&a),
+        b_mean_ns: mean(&b),
+        u_statistic: result.u1,
+        z_score: result.z,
+        p_value_two_tailed: result.p_two_tailed,
+        prob_a_greater_than_b: result.prob_a_gt_b,
+        verdict,
+    };
+
+    println!("{}", serde_json::to_string(&out).unwrap());
 }
