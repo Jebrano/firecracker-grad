@@ -399,20 +399,30 @@ impl Env {
         pid: i32,
         chroot_exec_file: PathBuf,
     ) -> Result<(), JailerError> {
-        let chroot_exec_file_str = chroot_exec_file
-            .to_str()
+        // Build the PID file path inside the jail root (self.chroot_dir) rather
+        // than next to the exec binary. With the chroot backend this is equivalent
+        // (after pivot_root, "/firecracker.pid" and "<chroot_dir>/firecracker.pid"
+        // are the same inode). With the Landlock backend the jail root is the only
+        // directory the Landlock ruleset grants write access to, so writing outside
+        // of it would fail with EACCES.
+        let exec_file_name = chroot_exec_file
+            .file_name()
             .ok_or_else(|| JailerError::ExtractFileName(chroot_exec_file.clone()))?;
-        let pid_file_path =
-            PathBuf::from(format!("{}{}", chroot_exec_file_str, PID_FILE_EXTENSION));
+        let pid_file_path = self.chroot_dir.join(format!(
+            "{}{}",
+            exec_file_name.to_str().unwrap_or("firecracker"),
+            PID_FILE_EXTENSION
+        ));
         let mut pid_file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(pid_file_path.clone())
+            .open(&pid_file_path)
             .map_err(|err| JailerError::FileOpen(pid_file_path.clone(), err))?;
 
         // Write PID to file.
         write!(pid_file, "{}", pid).map_err(|err| JailerError::Write(pid_file_path, err))
     }
+
 
     fn get_userfaultfd_minor_dev_number() -> Result<u32, UserfaultfdParseError> {
         let buf = read_to_string("/proc/misc")?;
