@@ -337,7 +337,7 @@ impl Env {
         Ok(())
     }
 
-    fn exec_into_new_pid_ns(&mut self, chroot_exec_file: PathBuf) -> Result<(), JailerError> {
+    fn exec_into_new_pid_ns(&mut self, chroot_exec_file: PathBuf, pid_dir: &Path) -> Result<(), JailerError> {
         // https://man7.org/linux/man-pages/man7/pid_namespaces.7.html
         // > a process in an ancestor namespace can send signals to the "init" process of a child
         // > PID namespace only if the "init" process has established a handler for that signal.
@@ -387,7 +387,7 @@ impl Env {
             child_pid => {
                 // Save the PID of the process running the exec file provided
                 // inside <chroot_exec_file>.pid file.
-                self.save_exec_file_pid(child_pid, chroot_exec_file)?;
+                self.save_exec_file_pid(child_pid, &chroot_exec_file, pid_dir)?;
                 // SAFETY: This is safe because 0 is valid input to exit.
                 unsafe { libc::exit(0) }
             }
@@ -397,18 +397,18 @@ impl Env {
     fn save_exec_file_pid(
         &mut self,
         pid: i32,
-        chroot_exec_file: PathBuf,
+        chroot_exec_file: &Path,
+        pid_dir: &Path,
     ) -> Result<(), JailerError> {
-        // Build the PID file path inside the jail root (self.chroot_dir) rather
-        // than next to the exec binary. With the chroot backend this is equivalent
-        // (after pivot_root, "/firecracker.pid" and "<chroot_dir>/firecracker.pid"
-        // are the same inode). With the Landlock backend the jail root is the only
-        // directory the Landlock ruleset grants write access to, so writing outside
-        // of it would fail with EACCES.
+        // Build the PID file path inside the jail root. With the chroot backend
+        // this is called after chroot() has already happened, so pid_dir is "/"
+        // (the chroot's new root). With the Landlock backend pid_dir is
+        // self.chroot_dir, the host-absolute jail root directory -- the only
+        // directory the Landlock ruleset grants write access to.
         let exec_file_name = chroot_exec_file
             .file_name()
-            .ok_or_else(|| JailerError::ExtractFileName(chroot_exec_file.clone()))?;
-        let pid_file_path = self.chroot_dir.join(format!(
+            .ok_or_else(|| JailerError::ExtractFileName(chroot_exec_file.to_path_buf()))?;
+        let pid_file_path = pid_dir.join(format!(
             "{}{}",
             exec_file_name.to_str().unwrap_or("firecracker"),
             PID_FILE_EXTENSION
@@ -717,11 +717,11 @@ impl Env {
         #[cfg(target_arch = "aarch64")]
         self.copy_midr_el1_info()?;
 
-        // Jail self. The two backends produce the path that should subsequently be
-        // exec'd: for chroot that's a jail-relative path to the copy of the binary
-        // placed inside the jail; for Landlock it's simply the real, original path to
-        // the binary, since it was never copied anywhere.
-        let exec_target = match isolation {
+        // Jail self. The two backends produce a tuple of (exec_target, pid_dir):
+        // - exec_target: path to exec for Firecracker (chroot: jail-relative; Landlock: host path)
+        // - pid_dir: where to write the .pid file (chroot: "/" since we're already jailed;
+        //   Landlock: host path to the jail root, the only writable dir after Landlock is applied)
+        let (exec_target, pid_dir) = match isolation {
             Isolation::Chroot => {
                 let exec_file_name = self.copy_exec_to_chroot()?;
                 let chroot_exec_file = PathBuf::from("/").join(exec_file_name);
@@ -764,25 +764,40 @@ impl Env {
                     self.mknod_and_own_dev(DEV_UFFD_PATH, DEV_UFFD_MAJOR, minor)?;
                 }
 
-                chroot_exec_file
+                // After chroot, "/" *is* the jail root, so we write the .pid file there.
+                (chroot_exec_file, PathBuf::from("/"))
             }
             Isolation::Landlock => {
                 // The API socket's parent dir needs to exist before we can open an fd
                 // on it for the MakeSock rule below -- with chroot this came for free
                 // from FOLDER_HIERARCHY, since the jail root itself was freshly
-                // created. Nothing else from FOLDER_HIERARCHY is needed: there's no
-                // /dev to populate (the real /dev/kvm and /dev/net/tun are used
-                // directly) and no jail root ownership to fix up (Landlock doesn't
-                // care who owns the directory it's granting access to).
+                // created.
                 let api_sock_dir = Self::build_api_sock_arg(&mut self.extra_args, &self.chroot_dir);
                 if let Some(ref dir) = api_sock_dir {
                     fs::create_dir_all(dir)
                         .map_err(|err| JailerError::CreateDir(dir.clone(), err))?;
+                    // Firecracker runs as the target uid/gid. The directory created
+                    // above is owned by root (jailer must run with CAP_SYS_ADMIN for
+                    // Landlock), so chown it now so DAC allows Firecracker to
+                    // write/create files inside it later. This is the Landlock
+                    // equivalent of what the chroot backend's setup_jailed_folder()
+                    // does for /run.
+                    let c_path =
+                        CString::new(dir.to_str().unwrap())
+                            .map_err(JailerError::CStringParsing)?;
+                    // SAFETY: Safe because c_path is null-terminated.
+                    SyscallReturnCode(unsafe {
+                        libc::chown(c_path.as_ptr(), self.uid(), self.gid())
+                    })
+                    .into_empty_result()
+                    .map_err(|err| JailerError::ChangeFileOwner(dir.clone(), err))?;
                 }
 
                 apply_landlock(&self.chroot_dir, &self.exec_file_path, api_sock_dir.as_deref())?;
 
-                self.exec_file_path.clone()
+                // Landlock does no chroot, so the .pid file is written to the
+                // host-absolute jail root path.
+                (self.exec_file_path.clone(), self.chroot_dir.clone())
             }
         };
 
@@ -843,9 +858,9 @@ impl Env {
 
         // If specified, exec the provided binary into a new PID namespace.
         if self.new_pid_ns {
-            self.exec_into_new_pid_ns(exec_target)
+            self.exec_into_new_pid_ns(exec_target, &pid_dir)
         } else {
-            self.save_exec_file_pid(id().try_into().unwrap(), exec_target.clone())?;
+            self.save_exec_file_pid(id().try_into().unwrap(), &exec_target, &pid_dir)?;
             Err(JailerError::Exec(self.exec_command(exec_target)))
         }
     }
@@ -1533,11 +1548,13 @@ mod tests {
         mock_cgroups.add_v1_mounts().unwrap();
 
         let mut env = create_env(&mock_cgroups.proc_mounts_path);
-        env.save_exec_file_pid(pid, PathBuf::from(exec_file_name))
+        let pid_dir = env.chroot_dir().to_path_buf();
+        let pid_file_path = pid_dir.join(pid_file_name);
+        env.save_exec_file_pid(pid, Path::new(exec_file_name), &pid_dir)
             .unwrap();
 
-        let stored_pid = fs::read_to_string(pid_file_name);
-        fs::remove_file(pid_file_name).unwrap();
+        let stored_pid = fs::read_to_string(&pid_file_path);
+        fs::remove_file(&pid_file_path).unwrap();
         assert_eq!(stored_pid.unwrap(), "1");
     }
 }
