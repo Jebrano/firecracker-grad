@@ -768,20 +768,33 @@ impl Env {
                 (chroot_exec_file, PathBuf::from("/"))
             }
             Isolation::Landlock => {
+                // With Landlock there is no chroot(), so the jail root is a regular
+                // host directory. Firecracker runs as the target uid/gid, but
+                // main_exec() created jail_root as root:root with mode 0o700 -- DAC
+                // would block Firecracker from even traversing into it. The chroot
+                // backend fixes this via setup_jailed_folder("/") after chroot();
+                // Landlock must do it here, before apply_landlock() (which needs an
+                // fd on jail_root anyway, so the dir must exist and be accessible).
+                let c_root =
+                    CString::new(self.chroot_dir.to_str().unwrap())
+                        .map_err(JailerError::CStringParsing)?;
+                // SAFETY: Safe because c_root is null-terminated.
+                SyscallReturnCode(unsafe {
+                    libc::chown(c_root.as_ptr(), self.uid(), self.gid())
+                })
+                .into_empty_result()
+                .map_err(|err| {
+                    JailerError::ChangeFileOwner(self.chroot_dir.clone(), err)
+                })?;
+
                 // The API socket's parent dir needs to exist before we can open an fd
-                // on it for the MakeSock rule below -- with chroot this came for free
-                // from FOLDER_HIERARCHY, since the jail root itself was freshly
-                // created.
+                // on it for the MakeSock rule below.
                 let api_sock_dir = Self::build_api_sock_arg(&mut self.extra_args, &self.chroot_dir);
                 if let Some(ref dir) = api_sock_dir {
                     fs::create_dir_all(dir)
                         .map_err(|err| JailerError::CreateDir(dir.clone(), err))?;
-                    // Firecracker runs as the target uid/gid. The directory created
-                    // above is owned by root (jailer must run with CAP_SYS_ADMIN for
-                    // Landlock), so chown it now so DAC allows Firecracker to
-                    // write/create files inside it later. This is the Landlock
-                    // equivalent of what the chroot backend's setup_jailed_folder()
-                    // does for /run.
+                    // chown is still needed here: the jailer (running as root) just
+                    // created this subdirectory, so it inherited root ownership.
                     let c_path =
                         CString::new(dir.to_str().unwrap())
                             .map_err(JailerError::CStringParsing)?;
