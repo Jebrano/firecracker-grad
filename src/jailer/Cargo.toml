@@ -21,6 +21,11 @@ name = "landlock-jailer"
 path = "src/bin/landlock_jailer.rs"
 bench = false
 
+[[bin]]
+name = "setup-bench"
+path = "src/bin/setup_bench.rs"
+bench = false
+
 
 [features]
 tracing = ["log-instrument", "utils/tracing"]
