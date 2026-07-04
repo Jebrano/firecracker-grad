@@ -13,6 +13,7 @@
 //! used to rely on chroot's path remapping (see `build_api_sock_arg()`).
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use landlock::{
     Access, AccessFs, BitFlags, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
@@ -153,21 +154,35 @@ fn base_rules(jail_root: &Path, exec_file: &Path, api_sock_dir: Option<&Path>) -
 /// `jail_root` does not need to exist as a `chroot` target anymore -- it's just a
 /// regular host directory now. Callers are still expected to `create_dir_all()` it
 /// first (same as today), since `PathFd::new()` needs something to open.
+/// Nanosecond breakdown of `apply_landlock`'s three internal phases. Always
+/// computed -- three extra `Instant::now()` VDSO reads cost tens of ns total
+/// against a function whose own cost is orders of magnitude larger -- so
+/// there's no separate instrumented/production code path to keep in sync.
+/// The `jailer`/`landlock-jailer` binaries ignore this return value; the
+/// `setup-bench` binary is the only consumer.
+pub struct LandlockTimings {
+    pub ruleset_create_ns: u128,
+    pub add_rules_ns: u128,
+    pub restrict_self_ns: u128,
+}
+
 pub fn apply_landlock(
     jail_root: &Path,
     exec_file: &Path,
     api_sock_dir: Option<&Path>,
-) -> Result<(), JailerError> {
+) -> Result<LandlockTimings, JailerError> {
     // Handle every access right up to our target ABI. This is what makes the
     // IoctlDev caveat above apply, and it's also required for forward/backward
     // compatibility per the crate's own guidance: handling the full set now means a
     // future ABI bump won't silently change which actions are denied by default.
     let access_all = AccessFs::from_all(TARGET_ABI);
 
+    let t_ruleset_start = Instant::now();
     let mut ruleset = Ruleset::default()
         .handle_access(access_all)
         .and_then(|r| r.create())
         .map_err(JailerError::LandlockRulesetCreate)?;
+    let t_ruleset_created = Instant::now();
 
     for rule in base_rules(jail_root, exec_file, api_sock_dir) {
         let fd = match PathFd::new(&rule.path) {
@@ -193,6 +208,7 @@ pub fn apply_landlock(
             .add_rule(PathBeneath::new(fd, rule.access))
             .map_err(|err| JailerError::LandlockAddRule(rule.path.clone(), err.to_string()))?;
     }
+    let t_rules_added = Instant::now();
 
     // restrict_self() performs both the ruleset enforcement (landlock_restrict_self())
     // and, by default, the prctl(PR_SET_NO_NEW_PRIVS) call -- in that fixed order,
@@ -201,6 +217,7 @@ pub fn apply_landlock(
     let status = ruleset
         .restrict_self()
         .map_err(JailerError::LandlockRestrictSelf)?;
+    let t_restricted = Instant::now();
 
     if !status.no_new_privs {
         return Err(JailerError::NoNewPrivs);
@@ -216,5 +233,9 @@ pub fn apply_landlock(
         return Err(JailerError::LandlockNotEnforced(status.ruleset));
     }
 
-    Ok(())
+    Ok(LandlockTimings {
+        ruleset_create_ns: (t_ruleset_created - t_ruleset_start).as_nanos(),
+        add_rules_ns: (t_rules_added - t_ruleset_created).as_nanos(),
+        restrict_self_ns: (t_restricted - t_rules_added).as_nanos(),
+    })
 }

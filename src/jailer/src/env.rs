@@ -10,6 +10,7 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio, exit, id};
+use std::time::Instant;
 
 use utils::arg_parser::UtilsArgParserError::MissingValue;
 use utils::time::{ClockType, get_time_us};
@@ -143,6 +144,42 @@ pub struct Env {
     cgroup_conf: Option<CgroupConfiguration>,
     resource_limits: ResourceLimits,
     uffd_dev_minor: Option<u32>,
+}
+
+/// Phase-by-phase nanosecond breakdown of `Env::setup_isolation`, produced
+/// by `run_setup_only` for the dedicated `setup-bench` binary. The
+/// `jailer`/`landlock-jailer` binaries never construct one of these --
+/// production `run()` calls the same underlying `setup_isolation` but
+/// discards its phase vector.
+pub struct BenchTimings {
+    pub condition: &'static str,
+    pub total_setup_ns: u128,
+    pub phases: Vec<(&'static str, u128)>,
+}
+
+impl BenchTimings {
+    /// Hand-rolled JSON (no serde dependency pulled into this crate just for
+    /// benchmark output). Format:
+    /// {"condition":"chroot","total_setup_ns":N,"phases":{"name":N,...}}
+    pub fn to_json(&self) -> String {
+        let mut out = String::with_capacity(256);
+        out.push_str("{\"condition\":\"");
+        out.push_str(self.condition);
+        out.push_str("\",\"total_setup_ns\":");
+        out.push_str(&self.total_setup_ns.to_string());
+        out.push_str(",\"phases\":{");
+        for (i, (name, ns)) in self.phases.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push('"');
+            out.push_str(name);
+            out.push_str("\":");
+            out.push_str(&ns.to_string());
+        }
+        out.push_str("}}");
+        out
+    }
 }
 
 impl Env {
@@ -685,14 +722,38 @@ impl Env {
         rewritten.parent().map(Path::to_path_buf)
     }
 
-    pub fn run(mut self, isolation: Isolation) -> Result<(), JailerError> {
+    /// Runs netns join, resource-limit install, cgroup setup, and the chosen
+    /// filesystem-isolation backend (chroot or Landlock) -- i.e. everything
+    /// needed before daemonizing/exec'ing -- with a nanosecond checkpoint
+    /// after each phase. Shared by `run()` (production; phases are
+    /// discarded) and `run_setup_only()` (the `setup-bench` binary; phases
+    /// are the whole point), so there is exactly one implementation of the
+    /// setup sequence and the two isolation backends stay a genuine A/B
+    /// pair no matter which binary is calling in.
+    #[allow(unused_assignments)]
+    fn setup_isolation(
+        &mut self,
+        isolation: Isolation,
+    ) -> Result<((PathBuf, PathBuf), Vec<(&'static str, u128)>), JailerError> {
+        let mut last_checkpoint = Instant::now();
+        let mut phases: Vec<(&'static str, u128)> = Vec::new();
+        macro_rules! checkpoint {
+            ($name:expr) => {{
+                let now = Instant::now();
+                phases.push(($name, (now - last_checkpoint).as_nanos()));
+                last_checkpoint = now;
+            }};
+        }
+
         // Join the specified network namespace, if applicable.
         if let Some(ref path) = self.netns {
             Env::join_netns(path)?;
+            checkpoint!("join_netns");
         }
 
         // Set limits on resources.
         self.resource_limits.install()?;
+        checkpoint!("resource_limits_install");
 
         // We have to setup cgroups at this point, because the chroot backend can't do
         // it anymore after chrooting. The Landlock backend has no such constraint, but
@@ -701,38 +762,35 @@ impl Env {
         // the benchmark comparison.
         if let Some(ref conf) = self.cgroup_conf {
             conf.setup()?;
+            checkpoint!("cgroup_setup");
         }
 
-        // If daemonization was requested, open /dev/null before jailing.
-        let dev_null = if self.daemonize {
-            Some(
-                File::open("/dev/null")
-                    .map_err(|err| JailerError::Open("/dev/null".into(), err))?,
-            )
-        } else {
-            None
-        };
         #[cfg(target_arch = "aarch64")]
-        self.copy_cache_info()?;
-        #[cfg(target_arch = "aarch64")]
-        self.copy_midr_el1_info()?;
+        {
+            self.copy_cache_info()?;
+            self.copy_midr_el1_info()?;
+            checkpoint!("arch_cache_info_copy");
+        }
 
         // Jail self. The two backends produce a tuple of (exec_target, pid_dir):
         // - exec_target: path to exec for Firecracker (chroot: jail-relative; Landlock: host path)
         // - pid_dir: where to write the .pid file (chroot: "/" since we're already jailed;
         //   Landlock: host path to the jail root, the only writable dir after Landlock is applied)
-        let (exec_target, pid_dir) = match isolation {
+        let paths = match isolation {
             Isolation::Chroot => {
                 let exec_file_name = self.copy_exec_to_chroot()?;
+                checkpoint!("copy_exec_to_chroot");
                 let chroot_exec_file = PathBuf::from("/").join(exec_file_name);
 
                 chroot(self.chroot_dir())?;
+                checkpoint!("chroot_pivot");
 
                 // This will not only create necessary directories, but will also
                 // change ownership for all of them.
                 FOLDER_HIERARCHY
                     .iter()
                     .try_for_each(|f| self.setup_jailed_folder(f))?;
+                checkpoint!("folder_hierarchy_setup");
 
                 // Here we are creating the /dev/kvm and /dev/net/tun devices inside
                 // the jailer. Following commands can be translated into bash like
@@ -743,8 +801,10 @@ impl Env {
                 // www.kernel.org/doc/Documentation/networking/tuntap.txt specifies 10
                 // and 200 as the major and minor for the /dev/net/tun device.
                 self.mknod_and_own_dev(DEV_NET_TUN, DEV_NET_TUN_MAJOR, DEV_NET_TUN_MINOR)?;
+                checkpoint!("mknod_tun");
                 // Do the same for /dev/kvm with (major, minor) = (10, 232).
                 self.mknod_and_own_dev(DEV_KVM, DEV_KVM_MAJOR, DEV_KVM_MINOR)?;
+                checkpoint!("mknod_kvm");
                 // And for /dev/urandom with (major, minor) = (1, 9).
                 // If the device is not accessible on the host, output a warning to
                 // inform user that MMDS version 2 will not be available to use.
@@ -757,11 +817,13 @@ impl Env {
                         );
                         println!("MMDS version 2 will not be available to use.");
                     });
+                checkpoint!("mknod_urandom_optional");
 
                 // If we have a minor version for /dev/userfaultfd the device is
                 // present on the host. Expose the device in the jailed environment.
                 if let Some(minor) = self.uffd_dev_minor {
                     self.mknod_and_own_dev(DEV_UFFD_PATH, DEV_UFFD_MAJOR, minor)?;
+                    checkpoint!("mknod_uffd_optional");
                 }
 
                 // After chroot, "/" *is* the jail root, so we write the .pid file there.
@@ -786,6 +848,7 @@ impl Env {
                 .map_err(|err| {
                     JailerError::ChangeFileOwner(self.chroot_dir.clone(), err)
                 })?;
+                checkpoint!("chown_jail_root");
 
                 // The API socket's parent dir needs to exist before we can open an fd
                 // on it for the MakeSock rule below.
@@ -804,14 +867,48 @@ impl Env {
                     })
                     .into_empty_result()
                     .map_err(|err| JailerError::ChangeFileOwner(dir.clone(), err))?;
+                    checkpoint!("api_sock_dir_setup");
                 }
 
-                apply_landlock(&self.chroot_dir, &self.exec_file_path, api_sock_dir.as_deref())?;
+                let landlock_timings = apply_landlock(
+                    &self.chroot_dir,
+                    &self.exec_file_path,
+                    api_sock_dir.as_deref(),
+                )?;
+                // apply_landlock's own Instant checkpoints isolate ruleset
+                // creation from rule-adding from restrict_self more precisely
+                // than bracketing the whole call here could, so absorb them
+                // directly instead of wrapping it in one outer checkpoint!.
+                phases.push(("landlock_ruleset_create", landlock_timings.ruleset_create_ns));
+                phases.push(("landlock_add_rules", landlock_timings.add_rules_ns));
+                phases.push(("landlock_restrict_self", landlock_timings.restrict_self_ns));
+                last_checkpoint = Instant::now();
 
                 // Landlock does no chroot, so the .pid file is written to the
                 // host-absolute jail root path.
                 (self.exec_file_path.clone(), self.chroot_dir.clone())
             }
+        };
+
+        Ok((paths, phases))
+    }
+
+    pub fn run(mut self, isolation: Isolation) -> Result<(), JailerError> {
+        let (exec_target_and_pid_dir, _phases) = self.setup_isolation(isolation)?;
+        let (exec_target, pid_dir) = exec_target_and_pid_dir;
+
+        // If daemonization was requested, open /dev/null before jailing.
+        // (Harmless reordering vs. the original inline version: this now
+        // happens after isolation setup instead of before it. Nothing in
+        // setup_isolation depends on dev_null, so this doesn't change
+        // behavior -- it only lets setup_isolation be lifted out cleanly.)
+        let dev_null = if self.daemonize {
+            Some(
+                File::open("/dev/null")
+                    .map_err(|err| JailerError::Open("/dev/null".into(), err))?,
+            )
+        } else {
+            None
         };
 
         self.jailer_cpu_time_us = get_time_us(ClockType::ProcessCpu) - self.start_time_cpu_us;
@@ -876,6 +973,32 @@ impl Env {
             self.save_exec_file_pid(id().try_into().unwrap(), &exec_target, &pid_dir)?;
             Err(JailerError::Exec(self.exec_command(exec_target)))
         }
+    }
+
+    /// Runs `setup_isolation` and returns its phase-by-phase timing instead
+    /// of continuing on to daemonize/exec. Used exclusively by the
+    /// `setup-bench` binary -- `jailer`/`landlock-jailer` never call this;
+    /// they call `run()`, which shares the same `setup_isolation` but
+    /// discards the timing and continues to exec Firecracker.
+    ///
+    /// A fresh `Env` (i.e. a fresh process) is expected per call: `chroot()`
+    /// and `landlock_restrict_self()` are one-way for a process, so looping
+    /// this method in-process across samples would mean later samples
+    /// measure a different (already-restricted) starting state than earlier
+    /// ones. `setup-bench` is meant to be invoked once per process by an
+    /// external driver script that spawns N fresh instances.
+    pub fn run_setup_only(mut self, isolation: Isolation) -> Result<BenchTimings, JailerError> {
+        let bench_start = Instant::now();
+        let (_paths, phases) = self.setup_isolation(isolation)?;
+        let condition = match isolation {
+            Isolation::Chroot => "chroot",
+            Isolation::Landlock => "landlock",
+        };
+        Ok(BenchTimings {
+            condition,
+            total_setup_ns: bench_start.elapsed().as_nanos(),
+            phases,
+        })
     }
 }
 
