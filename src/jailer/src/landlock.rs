@@ -160,6 +160,7 @@ fn base_rules(jail_root: &Path, exec_file: &Path, api_sock_dir: Option<&Path>) -
 /// there's no separate instrumented/production code path to keep in sync.
 /// The `jailer`/`landlock-jailer` binaries ignore this return value; the
 /// `setup-bench` binary is the only consumer.
+#[derive(Debug)]
 pub struct LandlockTimings {
     pub ruleset_create_ns: u128,
     pub add_rules_ns: u128,

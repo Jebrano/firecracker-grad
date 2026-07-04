@@ -151,6 +151,7 @@ pub struct Env {
 /// `jailer`/`landlock-jailer` binaries never construct one of these --
 /// production `run()` calls the same underlying `setup_isolation` but
 /// discards its phase vector.
+#[derive(Debug)]
 pub struct BenchTimings {
     pub condition: &'static str,
     pub total_setup_ns: u128,
