@@ -18,7 +18,7 @@ WARMUP_PER_CYCLE="${3:-50}"
 CORE_RANGE="2-3"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="$SCRIPT_DIR/target/release/open-bench"
+BIN="$SCRIPT_DIR/open-bench"
 WORKDIR="$(mktemp -d /tmp/open-bench.XXXXXX)"
 OUT="results.jsonl"
 
