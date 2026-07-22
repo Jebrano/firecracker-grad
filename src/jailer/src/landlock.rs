@@ -134,7 +134,7 @@ fn base_rules(jail_root: &Path, exec_file: &Path, api_sock_dir: Option<&Path>) -
     ];
 
     if let Some(dir) = api_sock_dir {
-        rules.push(RuleSpec::required(dir, AccessFs::MakeSock.into()));
+        rules.push(RuleSpec::required(dir, AccessFs::MakeSock | AccessFs::ReadFile | AccessFs::WriteFile));
     }
 
     rules.extend(strace_discovered_rules());
