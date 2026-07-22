@@ -895,14 +895,16 @@ impl Env {
     }
 
     pub fn run(mut self, isolation: Isolation) -> Result<(), JailerError> {
-        let (exec_target_and_pid_dir, _phases) = self.setup_isolation(isolation)?;
-        let (exec_target, pid_dir) = exec_target_and_pid_dir;
-
         // If daemonization was requested, open /dev/null before jailing.
-        // (Harmless reordering vs. the original inline version: this now
-        // happens after isolation setup instead of before it. Nothing in
-        // setup_isolation depends on dev_null, so this doesn't change
-        // behavior -- it only lets setup_isolation be lifted out cleanly.)
+        // This MUST happen before setup_isolation(), not after: /dev/null is
+        // not mknod'd inside the chroot jail (only tun/kvm/urandom/uffd are,
+        // see FOLDER_HIERARCHY/mknod_and_own_dev below) and is not covered
+        // by any Landlock rule (see base_rules() in landlock.rs). Opening it
+        // post-isolation would fail with ENOENT under chroot or EACCES
+        // under Landlock whenever --daemonize is set. Getting the fd here,
+        // before either restriction is applied, and letting it survive
+        // (fds are inherited across both chroot and Landlock restriction)
+        // is what the original code relied on -- this preserves that.
         let dev_null = if self.daemonize {
             Some(
                 File::open("/dev/null")
@@ -911,6 +913,9 @@ impl Env {
         } else {
             None
         };
+
+        let (exec_target_and_pid_dir, _phases) = self.setup_isolation(isolation)?;
+        let (exec_target, pid_dir) = exec_target_and_pid_dir;
 
         self.jailer_cpu_time_us = get_time_us(ClockType::ProcessCpu) - self.start_time_cpu_us;
 
@@ -988,18 +993,33 @@ impl Env {
     /// measure a different (already-restricted) starting state than earlier
     /// ones. `setup-bench` is meant to be invoked once per process by an
     /// external driver script that spawns N fresh instances.
-    pub fn run_setup_only(mut self, isolation: Isolation) -> Result<BenchTimings, JailerError> {
+    /// Runs `setup_isolation` and returns its phase timings *plus* the
+    /// directory subsequent in-process file operations should use as their
+    /// base: `/` for chroot (pivot_root already remapped it -- this is
+    /// exactly `setup_isolation`'s own `pid_dir`), or the real
+    /// host-absolute jail root for Landlock (no remapping happens, so
+    /// callers need the real path). `run_setup_only` itself doesn't need
+    /// this, but the `multi-file-open` bench mode does, since it keeps
+    /// operating on the same restricted process instead of exiting right
+    /// after setup the way this method's callers otherwise would.
+    pub fn run_setup_only(
+        mut self,
+        isolation: Isolation,
+    ) -> Result<(BenchTimings, PathBuf), JailerError> {
         let bench_start = Instant::now();
-        let (_paths, phases) = self.setup_isolation(isolation)?;
+        let ((_exec_target, pid_dir), phases) = self.setup_isolation(isolation)?;
         let condition = match isolation {
             Isolation::Chroot => "chroot",
             Isolation::Landlock => "landlock",
         };
-        Ok(BenchTimings {
-            condition,
-            total_setup_ns: bench_start.elapsed().as_nanos(),
-            phases,
-        })
+        Ok((
+            BenchTimings {
+                condition,
+                total_setup_ns: bench_start.elapsed().as_nanos(),
+                phases,
+            },
+            pid_dir,
+        ))
     }
 }
 
