@@ -31,17 +31,19 @@
 //!
 //! Usage:
 //!   setup-bench --isolation chroot   --mode setup            --id <id> --exec-file <path> --uid <uid> --gid <gid> --chroot-base-dir <dir>
-//!   setup-bench --isolation landlock --mode multi-file-open  --id <id> --exec-file <path> --uid <uid> --gid <gid> --chroot-base-dir <dir> -- --api-sock /run/api.sock
+//!   setup-bench --isolation landlock --mode multi-file-open  --id <id> --exec-file <path> --uid <uid> --gid <gid> --chroot-base-dir <dir>
 //!
 //! All flags other than --isolation/--mode are exactly jailer's own flags
 //! (this binary builds its parser by extending `jailer::build_arg_parser()`),
 //! so --exec-file must point at a real, readable regular file (existing
 //! validation requires it) even though it's never exec'd. `multi-file-open`
-//! additionally requires `-- --api-sock /run/api.sock` (or any --api-sock
-//! value) as an extra arg: that's what makes Landlock's setup create a
-//! `/run` directory the same way chroot's FOLDER_HIERARCHY always does, so
-//! both conditions have the same directory to hold the metrics FIFO and log
-//! file the probe opens.
+//! stages every fixture file it opens -- including the /run directory, the
+//! metrics FIFO, and the log file -- *before* isolation is applied, not
+//! after: mkfifo() specifically needs Landlock's MakeFifo access right,
+//! which jail_root's rule deliberately doesn't grant (real deployments
+//! stage the metrics FIFO before the jailed process runs; it never creates
+//! one itself), so creating it post-restriction would fail with EACCES.
+//! No --api-sock argument is needed for this mode as a result.
 //!
 //! This binary is intended to grow additional modes for the other benchmark
 //! ideas (fleet-churn boot latency, etc.) rather than having each one
@@ -166,36 +168,44 @@ fn run_setup_mode(env: Env, isolation: Isolation) -> Result<(), JailerError> {
 /// same rationale as `run_setup_only`, just extended one step further
 /// instead of exiting right after setup.
 ///
-/// Fixture files that must exist *before* `run_setup_only` (before
-/// chroot's pivot_root / Landlock's restrict_self) are created here first,
-/// directly under `env.chroot_dir()`: a bind-mount-over-itself (chroot)
-/// preserves whatever's already there, and Landlock's jail_root
-/// `PathBeneath` rule already covers anything under it, so no landlock.rs
-/// changes are needed for those two. `/run`, however, is only created
-/// *during* setup_isolation itself (chroot's FOLDER_HIERARCHY always
-/// creates it; Landlock only creates it when `build_api_sock_arg` sees
-/// `--api-sock` among the extra args) -- see this binary's top-level doc
-/// comment for why `-- --api-sock ...` is required for this mode. The two
-/// fixture files that belong under `/run` are therefore created only
-/// *after* `run_setup_only` returns.
+/// All fixture files -- including `/run` and the metrics FIFO -- are
+/// created *before* `run_setup_only` (before chroot's pivot_root /
+/// Landlock's restrict_self), not after: a bind-mount-over-itself (chroot)
+/// preserves whatever's already there regardless of nesting, and
+/// Landlock's jail_root `PathBeneath` rule already covers *opening*
+/// anything under it, so no landlock.rs changes are needed for any of
+/// this. Creating the FIFO specifically has to happen before restriction
+/// takes effect: mkfifo() needs Landlock's MakeFifo right, which
+/// jail_root's rule intentionally doesn't grant, mirroring how a real
+/// deployment's orchestrator stages the metrics FIFO ahead of time rather
+/// than having the jailed process create it.
 fn run_multi_file_open_mode(env: Env, isolation: Isolation) -> Result<(), JailerError> {
+    // All fixtures are created here, before run_setup_only() -- i.e. before
+    // chroot's pivot_root or Landlock's restrict_self() take effect -- and
+    // that's not just convenient, it's required. mkfifo() needs Landlock's
+    // MakeFifo access right specifically; jail_root's rule in landlock.rs
+    // only grants MakeReg (regular files), not MakeFifo, and deliberately
+    // so -- real Firecracker deployments have an orchestrator stage the
+    // metrics FIFO before the jailed process ever runs; the jailed process
+    // itself never creates one. So rather than widen the production
+    // ruleset to make a post-restriction mkfifo() work, every fixture is
+    // staged up front instead, matching how it actually happens in
+    // production. A chroot bind-mount-over-itself preserves nested
+    // directories/files the same way it preserves top-level ones, and
+    // Landlock's jail_root PathBeneath rule already covers *opening* (not
+    // creating) anything under it, so no landlock.rs changes are needed --
+    // only the ordering here.
     write_fixture_file(&env.chroot_dir().join("kernel.img"), b"pretend-kernel-image")?;
     write_fixture_file(&env.chroot_dir().join("rootfs.ext4"), b"pretend-rootfs-image")?;
+    let run_dir = env.chroot_dir().join("run");
+    fs::create_dir_all(&run_dir).map_err(|err| JailerError::CreateDir(run_dir.clone(), err))?;
+    make_fifo(&run_dir.join("metrics.fifo"))?;
+    write_fixture_file(&run_dir.join("firecracker.log"), b"")?;
 
     let (timings, base_dir) = env.run_setup_only(isolation)?;
 
-    let run_dir = base_dir.join("run");
-    if !run_dir.is_dir() {
-        eprintln!(
-            "warning: {} doesn't exist -- did you pass `-- --api-sock /run/api.sock`? \
-             (required for Landlock; chroot always creates /run regardless)",
-            run_dir.display()
-        );
-    }
-    let metrics_fifo = run_dir.join("metrics.fifo");
-    let log_file = run_dir.join("firecracker.log");
-    make_fifo(&metrics_fifo)?;
-    write_fixture_file(&log_file, b"")?;
+    let metrics_fifo = base_dir.join("run").join("metrics.fifo");
+    let log_file = base_dir.join("run").join("firecracker.log");
 
     // /dev/kvm and /dev/net/tun resolve identically under both conditions --
     // chroot mknod's real device nodes at these exact paths inside the jail;
