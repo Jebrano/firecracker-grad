@@ -1,0 +1,16 @@
+[package]
+name = "boot-bench"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "boot-bench"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+regex = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "time"] }
+hyper = { version = "0.14", features = ["client", "http1", "tcp"] }
+hyperlocal = "0.8"
