@@ -26,6 +26,11 @@ name = "setup-bench"
 path = "src/bin/setup_bench.rs"
 bench = false
 
+[[bin]]
+name = "fleet-chrun-bench"
+path = "src/bin/fleet_chrun_bench.rs"
+bench = false
+
 
 [features]
 tracing = ["log-instrument", "utils/tracing"]

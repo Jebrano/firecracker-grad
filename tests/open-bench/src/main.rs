@@ -59,6 +59,13 @@ enum Mode {
         /// across interleaved cycles into one file).
         #[arg(long, default_value_t = false)]
         raw_append: bool,
+        /// Model snapshot-file creation instead of re-opening an existing
+        /// file: each iteration creates a FRESH file (O_CREAT|O_EXCL) and
+        /// unlinks it immediately after (outside the timed window), rather
+        /// than repeatedly opening target_name. target_name is ignored
+        /// when this is set. See run_openat_create_loop's doc comment.
+        #[arg(long, default_value_t = false)]
+        create: bool,
     },
     /// landlock_restrict_self() before the loop.
     Landlock {
@@ -76,6 +83,8 @@ enum Mode {
         raw_out: Option<PathBuf>,
         #[arg(long, default_value_t = false)]
         raw_append: bool,
+        #[arg(long, default_value_t = false)]
+        create: bool,
     },
     /// chroot() before the loop.
     Chroot {
@@ -91,6 +100,8 @@ enum Mode {
         raw_out: Option<PathBuf>,
         #[arg(long, default_value_t = false)]
         raw_append: bool,
+        #[arg(long, default_value_t = false)]
+        create: bool,
     },
     /// Mann-Whitney U test between two raw sample files (one ns value per line).
     /// Uses the normal approximation with tie correction, which is standard
@@ -194,6 +205,79 @@ fn run_openat_loop(dir_fd: RawFd, name: &str, iterations: u32, warmup: u32) -> V
 }
 
 
+/// Models Firecracker's snapshot-file creation specifically -- a NEW file
+/// at a path that doesn't exist yet (O_CREAT|O_EXCL) -- rather than the
+/// plain-open loop's repeated open of one already-existing file. This
+/// exercises Landlock's MakeReg mediation on the *parent directory*, a
+/// different rule path from ReadFile on the file itself, and matches
+/// Firecracker's actual snapshot semantics (a fresh file per snapshot, not
+/// reopening the same name).
+///
+/// Each iteration gets a fresh filename via a monotonic counter (shared
+/// across warmup and timed phases, so names never repeat) and unlinks it
+/// immediately after close -- OUTSIDE the timed window. Without the
+/// unlink, directory size would grow with iteration count, and on
+/// filesystems where lookup/insertion cost scales with directory size,
+/// later iterations would pay a different (higher) cost than earlier
+/// ones purely from that growth -- an ordering-adjacent confound in the
+/// same family as the ones already found in this project (path depth,
+/// run ordering), just triggered by iteration count instead of run order.
+/// Warmup iterations run the identical create+unlink pattern (discarded)
+/// rather than the plain-open loop's warmup, so whatever cache/ruleset
+/// warmth exists going into the timed loop matches what the timed loop
+/// itself does.
+fn run_openat_create_loop(dir_fd: RawFd, iterations: u32, warmup: u32) -> Vec<u128> {
+    let mut counter: u64 = 0;
+
+    for _ in 0..warmup {
+        let c_name = CString::new(format!("snapshot_{:016x}", counter)).unwrap();
+        counter += 1;
+        // SAFETY: dir_fd is a valid O_DIRECTORY fd; c_name is a filename
+        // never used before in this directory, so O_EXCL cannot spuriously
+        // collide with a leftover from an earlier iteration.
+        let fd = unsafe {
+            libc::openat(
+                dir_fd,
+                c_name.as_ptr(),
+                libc::O_CREAT | libc::O_WRONLY | libc::O_EXCL | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
+        // SAFETY: c_name is the path just (possibly) created above.
+        unsafe { libc::unlinkat(dir_fd, c_name.as_ptr(), 0) };
+    }
+
+    let mut samples = Vec::with_capacity(iterations as usize);
+    for _ in 0..iterations {
+        let c_name = CString::new(format!("snapshot_{:016x}", counter)).unwrap();
+        counter += 1;
+
+        let t0 = Instant::now();
+        // SAFETY: same as the warmup loop above.
+        let fd = unsafe {
+            libc::openat(
+                dir_fd,
+                c_name.as_ptr(),
+                libc::O_CREAT | libc::O_WRONLY | libc::O_EXCL | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        let elapsed = t0.elapsed().as_nanos();
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
+        // Unlink OUTSIDE the timed window -- see doc comment above.
+        unsafe { libc::unlinkat(dir_fd, c_name.as_ptr(), 0) };
+
+        samples.push(elapsed);
+    }
+    samples
+}
+
+
 fn write_raw(path: &Path, samples: &[u128], append: bool) -> std::io::Result<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).write(true);
@@ -256,7 +340,7 @@ fn main() {
     }
 
     let (condition, samples, iterations, warmup, raw_out, raw_append) = match cli.mode {
-        Mode::Baseline { target_dir, target_name, iterations, warmup, raw_out, raw_append } => {
+        Mode::Baseline { target_dir, target_name, iterations, warmup, raw_out, raw_append, create } => {
             // Open dir_fd BEFORE any restriction (none here, but kept symmetric).
             let dir_cstr = CString::new(
                 target_dir.as_os_str().as_encoded_bytes()
@@ -267,10 +351,14 @@ fn main() {
             };
             assert!(dir_fd >= 0, "open target_dir failed");
 
-            let samples = run_openat_loop(dir_fd, &target_name, iterations, warmup);
+            let samples = if create {
+                run_openat_create_loop(dir_fd, iterations, warmup)
+            } else {
+                run_openat_loop(dir_fd, &target_name, iterations, warmup)
+            };
             ("baseline_unrestricted".to_string(), samples, iterations, warmup, raw_out, raw_append)
         }
-        Mode::Landlock { target_dir, target_name, allow_root, iterations, warmup, raw_out, raw_append } => {
+        Mode::Landlock { target_dir, target_name, allow_root, iterations, warmup, raw_out, raw_append, create } => {
             // Open dir_fd BEFORE landlock restriction.
             let dir_cstr = CString::new(
                 target_dir.as_os_str().as_encoded_bytes()
@@ -281,12 +369,18 @@ fn main() {
             assert!(dir_fd >= 0, "open target_dir failed");
 
             // Now apply Landlock — dir_fd remains usable (opened pre-restriction).
+            // from_all() already grants MakeReg on allow_root, so --create
+            // needs no ruleset changes here.
             setup_landlock(&allow_root);
 
-            let samples = run_openat_loop(dir_fd, &target_name, iterations, warmup);
+            let samples = if create {
+                run_openat_create_loop(dir_fd, iterations, warmup)
+            } else {
+                run_openat_loop(dir_fd, &target_name, iterations, warmup)
+            };
             ("landlock_restricted".to_string(), samples, iterations, warmup, raw_out, raw_append)
         }
-        Mode::Chroot { jail_root, target_name, iterations, warmup, raw_out, raw_append } => {
+        Mode::Chroot { jail_root, target_name, iterations, warmup, raw_out, raw_append, create } => {
             // Open dir_fd pointing at the jail BEFORE chroot.
             let dir_cstr = CString::new(
                 jail_root.as_os_str().as_encoded_bytes()
@@ -300,7 +394,11 @@ fn main() {
             chdir("/").expect("chdir(\"/\") after chroot failed");
 
             // dir_fd is still valid — it was opened before chroot.
-            let samples = run_openat_loop(dir_fd, &target_name, iterations, warmup);
+            let samples = if create {
+                run_openat_create_loop(dir_fd, iterations, warmup)
+            } else {
+                run_openat_loop(dir_fd, &target_name, iterations, warmup)
+            };
             ("chroot_restricted".to_string(), samples, iterations, warmup, raw_out, raw_append)
         }
         Mode::Analyze { .. } => unreachable!("handled above"),
