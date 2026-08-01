@@ -227,7 +227,7 @@ fn spawn_jailer(args: &Args, id: &str, log_path: &Path) -> std::io::Result<Child
         .arg("Info")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
 }
 
@@ -244,7 +244,16 @@ fn wait_for_socket(
             return Err("timed out waiting for API socket".to_string());
         }
         if let Ok(Some(status)) = child.try_wait() {
-            return Err(format!("jailer exited early with {}", status));
+            let mut details = format!("jailer exited early with {}", status);
+            if let Some(mut stderr_pipe) = child.stderr.take() {
+                use std::io::Read;
+                let mut buf = String::new();
+                if stderr_pipe.read_to_string(&mut buf).is_ok() && !buf.is_empty() {
+                    details.push_str("\njailer stderr: ");
+                    details.push_str(buf.trim());
+                }
+            }
+            return Err(details);
         }
         if socket_path.exists() {
             if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
@@ -254,6 +263,7 @@ fn wait_for_socket(
         std::thread::sleep(Duration::from_micros(500));
     }
 }
+
 
 async fn send_request(
     client: &Client<hyperlocal::UnixConnector>,
