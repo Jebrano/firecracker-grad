@@ -466,6 +466,7 @@ fn run_one_cycle(args: &Args, id: &str, rt: &tokio::runtime::Runtime) -> Result<
     std::os::unix::fs::chown(&log_path, Some(uid), Some(gid))
         .map_err(|e| format!("failed to chown log file: {}", e))?;
 
+
     // Copy kernel+rootfs into jail_root for BOTH conditions -- see this
     // file's top comment for why this must happen uniformly, not just for
     // chroot. Safe to do before spawning jailer: chroot's bind-mount-over-
@@ -477,6 +478,19 @@ fn run_one_cycle(args: &Args, id: &str, rt: &tokio::runtime::Runtime) -> Result<
         .map_err(|e| format!("failed to copy kernel into jail: {}", e))?;
     std::fs::copy(&args.rootfs, &rootfs_dest)
         .map_err(|e| format!("failed to copy rootfs into jail: {}", e))?;
+
+
+    // Chown everything we placed in the jail so Firecracker (running as uid:gid)
+    // can access them. Needed for BOTH chroot and Landlock.
+    {
+        let uid: u32 = args.uid.parse().map_err(|e| format!("bad uid: {}", e))?;
+        let gid: u32 = args.gid.parse().map_err(|e| format!("bad gid: {}", e))?;
+        for f in [&kernel_dest, &rootfs_dest, &log_path] {
+            std::os::unix::fs::chown(f, Some(uid), Some(gid))
+                .map_err(|e| format!("failed to chown {}: {}", f.display(), e))?;
+        }
+    }
+
 
     let kernel_path_for_api = api_path_for(&args.isolation, &jail_root, "vmlinux");
     let rootfs_path_for_api = api_path_for(&args.isolation, &jail_root, "rootfs.ext4");
