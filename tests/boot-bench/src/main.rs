@@ -460,6 +460,12 @@ fn run_one_cycle(args: &Args, id: &str, rt: &tokio::runtime::Runtime) -> Result<
         .map_err(|e| format!("failed to pre-create run dir: {}", e))?;
     std::fs::write(&log_path, "").map_err(|e| format!("failed to pre-create log file: {}", e))?;
 
+    // We need to chown the log file to the target uid/gid
+    let uid: u32 = args.uid.parse().expect("uid must be a u32");
+    let gid: u32 = args.gid.parse().expect("gid must be a u32");
+    std::os::unix::fs::chown(&log_path, Some(uid), Some(gid))
+        .map_err(|e| format!("failed to chown log file: {}", e))?;
+
     // Copy kernel+rootfs into jail_root for BOTH conditions -- see this
     // file's top comment for why this must happen uniformly, not just for
     // chroot. Safe to do before spawning jailer: chroot's bind-mount-over-

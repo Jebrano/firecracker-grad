@@ -21,7 +21,7 @@ set -euo pipefail
 CYCLES="${1:-100}"
 EXEC_FILE="${2:?usage: $0 [cycles] <path-to-real-firecracker-binary> [chroot-base-dir]}"
 CHROOT_BASE="${3:-/srv/jailer-bench}"
-CORE_RANGE="2-3"
+CORE_RANGE="3"
 JAILER_UID="${JAILER_UID:-6000}"
 JAILER_GID="${JAILER_GID:-6000}"
 

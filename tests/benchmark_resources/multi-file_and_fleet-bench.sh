@@ -17,17 +17,17 @@ set -euo pipefail
 CYCLES="${1:-100}"
 EXEC_FILE="${2:?usage: $0 [cycles] <path-to-real-firecracker-binary> [chroot-base-dir]}"
 CHROOT_BASE="${3:-/srv/jailer-bench}"
-CORE_RANGE="2-3"
+CORE_RANGE="3"
 JAILER_UID="${JAILER_UID:-123}"
 JAILER_GID="${JAILER_GID:-100}"
 FLEET_TIMEOUT_MS="${FLEET_TIMEOUT_MS:-2000}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SETUP_BENCH_BIN="$SCRIPT_DIR/target/release/setup-bench"
-JAILER_BIN="$SCRIPT_DIR/target/release/jailer"
-LANDLOCK_BIN="$SCRIPT_DIR/target/release/landlock-jailer"
-FLEET_BIN="$SCRIPT_DIR/target/release/fleet-churn-bench"
-OPEN_BENCH_BIN="${OPEN_BENCH_BIN:-$SCRIPT_DIR/../landlock-open-bench-v2/target/release/open-bench}"
+SETUP_BENCH_BIN="$SCRIPT_DIR/setup-bench"
+JAILER_BIN="$SCRIPT_DIR/jailer"
+LANDLOCK_BIN="$SCRIPT_DIR/landlock-jailer"
+FLEET_BIN="$SCRIPT_DIR/fleet-churn-bench"
+OPEN_BENCH_BIN="${OPEN_BENCH_BIN:-$SCRIPT_DIR/open-bench}"
 
 for bin in "$SETUP_BENCH_BIN" "$JAILER_BIN" "$LANDLOCK_BIN" "$FLEET_BIN" "$OPEN_BENCH_BIN"; do
   if [[ ! -x "$bin" ]]; then
