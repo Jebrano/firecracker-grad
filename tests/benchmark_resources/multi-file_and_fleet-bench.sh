@@ -26,7 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SETUP_BENCH_BIN="$SCRIPT_DIR/setup-bench"
 JAILER_BIN="$SCRIPT_DIR/jailer"
 LANDLOCK_BIN="$SCRIPT_DIR/landlock-jailer"
-FLEET_BIN="$SCRIPT_DIR/fleet-churn-bench"
+FLEET_BIN="$SCRIPT_DIR/fleet-chrun-bench"
 OPEN_BENCH_BIN="${OPEN_BENCH_BIN:-$SCRIPT_DIR/open-bench}"
 
 for bin in "$SETUP_BENCH_BIN" "$JAILER_BIN" "$LANDLOCK_BIN" "$FLEET_BIN" "$OPEN_BENCH_BIN"; do
