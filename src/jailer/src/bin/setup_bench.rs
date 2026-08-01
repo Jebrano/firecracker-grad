@@ -204,33 +204,103 @@ fn run_multi_file_open_mode(env: Env, isolation: Isolation) -> Result<(), Jailer
 
     let (timings, base_dir) = env.run_setup_only(isolation)?;
 
-    let metrics_fifo = base_dir.join("run").join("metrics.fifo");
-    let log_file = base_dir.join("run").join("firecracker.log");
+    // Open directory fds ONCE, then openat() with just the filename below --
+    // same fix as open-bench's dir_fd/openat design, applied here because
+    // this probe had the identical confound: chroot's base_dir is "/" (1
+    // component to "/kernel.img"), landlock's base_dir is the real host jail
+    // path (5-6 components to walk on every absolute-path open() call). A
+    // plain libc::open() on the full path re-walks every intermediate
+    // component from "/" each time; openat() from an already-open directory
+    // fd only resolves the final component, regardless of how deep that
+    // directory's own path happens to be. Without this, landlock's numbers
+    // here would conflate "cost of Landlock's mediation" with "cost of a much
+    // longer absolute path" -- exactly the confound already fixed once before
+    // in open-bench's baseline-vs-chroot comparison; it just didn't get
+    // carried over into this probe when it was written.
+    let base_dir_c = CString::new(base_dir.to_str().unwrap()).map_err(JailerError::CStringParsing)?;
+    let base_dir_fd = unsafe {
+        libc::open(
+            base_dir_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if base_dir_fd < 0 {
+        return Err(JailerError::FileOpen(base_dir.clone(), std::io::Error::last_os_error()));
+    }
+
+    let run_dir = base_dir.join("run");
+    let run_dir_c = CString::new(run_dir.to_str().unwrap()).map_err(JailerError::CStringParsing)?;
+    let run_dir_fd = unsafe {
+        libc::open(
+            run_dir_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if run_dir_fd < 0 {
+        return Err(JailerError::FileOpen(run_dir.clone(), std::io::Error::last_os_error()));
+    }
+
+    // (dir_fd, filename, display_label) -- display_label is what shows up in
+    // the JSON output, kept as a plain filename now that path depth is no
+    // longer part of what's being measured for these four.
+    let relative_probes: [(libc::c_int, &str); 4] = [
+        (base_dir_fd, "kernel.img"),
+        (base_dir_fd, "rootfs.ext4"),
+        (run_dir_fd, "metrics.fifo"),
+        (run_dir_fd, "firecracker.log"),
+    ];
+
+    let mut per_file_ns: Vec<(String, u128)> = Vec::with_capacity(6);
+
+    for (dir_fd, name) in relative_probes {
+        let c_name = CString::new(name).map_err(JailerError::CStringParsing)?;
+        let t0 = Instant::now();
+        // SAFETY: dir_fd is a valid, still-open O_DIRECTORY fd from above;
+        // c_name is a valid null-terminated filename within it. O_NONBLOCK
+        // matters for metrics.fifo specifically -- a plain blocking open()
+        // on a FIFO with no writer connected would hang the benchmark
+        // forever; harmless for the regular files, applied uniformly rather
+        // than special-cased per path.
+        let fd = unsafe {
+            libc::openat(
+                dir_fd,
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        let elapsed = t0.elapsed().as_nanos();
+        if fd < 0 {
+            let path_for_error = if dir_fd == base_dir_fd {
+                base_dir.join(name)
+            } else {
+                run_dir.join(name)
+            };
+            unsafe {
+                libc::close(base_dir_fd);
+                libc::close(run_dir_fd);
+            }
+            return Err(JailerError::FileOpen(path_for_error, std::io::Error::last_os_error()));
+        }
+        unsafe {
+            libc::close(fd);
+        }
+        per_file_ns.push((name.to_string(), elapsed));
+    }
+
+    unsafe {
+        libc::close(base_dir_fd);
+        libc::close(run_dir_fd);
+    }
 
     // /dev/kvm and /dev/net/tun resolve identically under both conditions --
     // chroot mknod's real device nodes at these exact paths inside the jail;
-    // Landlock grants the real host device paths directly -- so the same
-    // two absolute strings are correct either way, unlike the other four
-    // paths below, which are base_dir-relative and differ per condition.
-    let probe_paths: Vec<PathBuf> = vec![
-        base_dir.join("kernel.img"),
-        base_dir.join("rootfs.ext4"),
-        metrics_fifo,
-        log_file,
-        PathBuf::from("/dev/kvm"),
-        PathBuf::from("/dev/net/tun"),
-    ];
-
-    let mut per_file_ns: Vec<(String, u128)> = Vec::with_capacity(probe_paths.len());
-    for path in &probe_paths {
-        let c_path = CString::new(path.to_str().unwrap()).map_err(JailerError::CStringParsing)?;
+    // Landlock grants the real host device paths directly -- so the same two
+    // absolute strings are correct, and identically shallow (2 components),
+    // either way. No dir_fd needed here since there's no depth asymmetry to
+    // control for.
+    for path_str in ["/dev/kvm", "/dev/net/tun"] {
+        let c_path = CString::new(path_str).unwrap();
         let t0 = Instant::now();
-        // SAFETY: c_path is a valid null-terminated string. O_NONBLOCK
-        // matters for metrics_fifo specifically -- a plain blocking open()
-        // on a FIFO with no writer connected would hang the benchmark
-        // forever; it's harmless for the regular files and device nodes in
-        // this same list, so it's applied uniformly rather than special-
-        // cased per path.
         let fd = unsafe {
             libc::open(
                 c_path.as_ptr(),
@@ -240,15 +310,14 @@ fn run_multi_file_open_mode(env: Env, isolation: Isolation) -> Result<(), Jailer
         let elapsed = t0.elapsed().as_nanos();
         if fd < 0 {
             return Err(JailerError::FileOpen(
-                path.clone(),
+                PathBuf::from(path_str),
                 std::io::Error::last_os_error(),
             ));
         }
-        // SAFETY: fd is the descriptor just returned by the open() above.
         unsafe {
             libc::close(fd);
         }
-        per_file_ns.push((path.display().to_string(), elapsed));
+        per_file_ns.push((path_str.to_string(), elapsed));
     }
 
     println!("{}", multi_file_json(&timings, &per_file_ns));
