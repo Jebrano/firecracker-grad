@@ -470,14 +470,7 @@ fn run_one_cycle(args: &Args, id: &str, rt: &tokio::runtime::Runtime) -> Result<
         .map_err(|e| format!("failed to pre-create run dir: {}", e))?;
     std::fs::write(&log_path, "").map_err(|e| format!("failed to pre-create log file: {}", e))?;
 
-    // We need to chown the log file to the target uid/gid
-    let uid: u32 = args.uid.parse().expect("uid must be a u32");
-    let gid: u32 = args.gid.parse().expect("gid must be a u32");
-    std::os::unix::fs::chown(&log_path, Some(uid), Some(gid))
-        .map_err(|e| format!("failed to chown log file: {}", e))?;
-
-
-    // Copy kernel+rootfs into jail_root for BOTH conditions -- see this
+      // Copy kernel+rootfs into jail_root for BOTH conditions -- see this
     // file's top comment for why this must happen uniformly, not just for
     // chroot. Safe to do before spawning jailer: chroot's bind-mount-over-
     // itself preserves whatever's already in jail_root (same precedent as
@@ -505,7 +498,9 @@ fn run_one_cycle(args: &Args, id: &str, rt: &tokio::runtime::Runtime) -> Result<
     let kernel_path_for_api = api_path_for(&args.isolation, &jail_root, "vmlinux");
     let rootfs_path_for_api = api_path_for(&args.isolation, &jail_root, "rootfs.ext4");
 
-    let mut child = spawn_jailer(args, id, Path::new("/run/firecracker.log"))
+    // Use jail-relative path for chroot, host-absolute for Landlock
+    let log_path_for_fc = api_path_for(&args.isolation, &jail_root, "run/firecracker.log");
+    let mut child = spawn_jailer(args, id, Path::new(&log_path_for_fc))
         .map_err(|e| format!("spawn failed: {}", e))?;
 
     let result = (|| -> Result<CycleResult, String> {
