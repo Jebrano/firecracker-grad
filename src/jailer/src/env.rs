@@ -995,8 +995,7 @@ impl Env {
     /// external driver script that spawns N fresh instances.
     /// Runs `setup_isolation` and returns its phase timings *plus* the
     /// directory subsequent in-process file operations should use as their
-    /// base: `/` for chroot (pivot_root already remapped it -- this is
-    /// exactly `setup_isolation`'s own `pid_dir`), or the real
+    /// base: `/` for chroot (pivot_root already remapped it), or the real
     /// host-absolute jail root for Landlock (no remapping happens, so
     /// callers need the real path). `run_setup_only` itself doesn't need
     /// this, but the `multi-file-open` bench mode does, since it keeps

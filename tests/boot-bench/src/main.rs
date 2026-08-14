@@ -1,48 +1,26 @@
-//! boot-bench: real guest boot latency, chroot vs Landlock.
-//!
 //! Distinct from fleet-churn-bench (which stops at "API socket
 //! connectable," deliberately before any guest boot happens) and from
 //! setup-bench (which never execs Firecracker at all). This one actually
 //! configures and boots a guest, using Firecracker's own built-in
-//! boot-timer device -- the same mechanism Firecracker's own
-//! `tests/integration_tests/performance/test_boottime.py` uses -- rather
+//! boot-timer device, the same mechanism Firecracker's own
+//! `tests/integration_tests/performance/test_boottime.py` uses, rather
 //! than inventing a new readiness signal. Firecracker itself measures and
 //! reports the number; this harness's job is just to configure the VM,
 //! trigger the boot, and parse Firecracker's own log line.
 //!
 //! ============================================================================
 //! REQUIRES A GUEST INIT BINARY THAT SIGNALS THE BOOT-TIMER DEVICE.
-//! See the sibling boot-signal/ crate -- and READ ITS TOP COMMENT. The
-//! magic MMIO address in there is an unverified placeholder; confirm it
-//! against your own Firecracker source before trusting these numbers.
+//! We can get one from the default devtool build_ci_artifacts rootfs.
 //! ============================================================================
+//! The `isolation` string ("chroot" or "landlock") decides how
+//! kernel/rootfs/snapshot paths are given to
+//! Firecracker's API, since chroot and Landlock give Firecracker
+//! fundamentally different filesystem views after exec -- chroot's
+//! pivot_root remaps "/" to the jail, so paths must be given
+//! relative-to-jail (e.g. "/vmlinux"); Landlock does no remapping, so paths
+//! must be the real host-absolute location.
 //!
-//! WHY --isolation EXISTS SEPARATELY FROM --condition
-//! ----------------------------------------------------
-//! --condition is a free-text label used only in the JSON output (you
-//! could type anything). --isolation chroot|landlock actually changes
-//! behavior: it decides how kernel/rootfs/snapshot paths are given to
-//! Firecracker's API. This matters because chroot and Landlock give
-//! Firecracker fundamentally different filesystem views after exec --
-//! chroot's pivot_root remaps "/" to the jail, so paths must be given
-//! relative-to-jail (e.g. "/vmlinux"); Landlock does no remapping, so
-//! paths must be the real host-absolute location. An earlier version of
-//! this harness passed the same --kernel/--rootfs host path straight
-//! through for both conditions, which only actually works for Landlock --
-//! under chroot it would silently need that exact host path to *also*
-//! exist nested inside the jail, which it won't unless by coincidence.
-//! Fixed by copying kernel+rootfs into jail_root once per cycle (same
-//! precedent as jailer's own copy_exec_to_chroot, just for two more files)
-//! and then passing condition-appropriate path strings for whichever one
-//! is actually running -- this happens for BOTH conditions uniformly (not
-//! just chroot) so a real, existing landlock rule (jail_root's own broad
-//! grant, already covering ReadFile/WriteFile/MakeReg) covers these files
-//! with no landlock.rs changes needed, at the cost of not exercising
-//! Landlock's no-copy-needed advantage for kernel/rootfs specifically --
-//! that's a different, explicitly-labeled experiment if you want to
-//! demonstrate it, not something this latency benchmark needs.
-//!
-//! MECHANISM (matches your test_boottime.py snippet exactly):
+//! MECHANISM (matches test_boottime.py):
 //!   1. Spawn jailer/landlock-jailer with extra args `--boot-timer
 //!      --log-path <file> --level Info` (passed through to Firecracker,
 //!      same as fleet-churn-bench's `--api-sock` extra arg).
@@ -53,46 +31,52 @@
 //!   5. PUT /actions {"action_type":"InstanceStart"}.
 //!   6. Poll the log file for the exact line Firecracker's own boot-timer
 //!      device writes: "Guest-boot-time = N us M ms, N2 CPU us M2 CPU ms",
-//!      using the identical regex from your test_boottime.py.
+//!      using the identical regex from test_boottime.py.
 //!   7. Report boot_time_us and cpu_boot_time_us -- Firecracker's own
-//!      numbers, not anything measured by this harness -- as one JSON
-//!      line.
+//!      numbers.
 //!   8. If --snapshot: PATCH /vm Paused, time PUT /snapshot/create,
 //!      PATCH /vm Resumed (matches the confirmed-current sequence:
-//!      snapshot/create is synchronous -- the HTTP response only returns
+//!      snapshot/create is synchronous, the HTTP response only returns
 //!      once the snapshot write is actually complete, so timing the
 //!      round-trip IS the snapshot latency, no separate completion signal
 //!      needed the way boot required one). This measurement is dominated
-//!      by actual memory-dump I/O (proportional to guest memory size) --
+//!      by actual memory-dump I/O (proportional to guest memory size)
 //!      it exists to positively confirm no regression at the layer where
 //!      it could matter, not to isolate a microsecond-scale mechanism
 //!      difference the way open-bench's --create mode does.
 //!   9. Tear down and clean up.
 //!
-//! Usage:
+//! Usage (single invocation now measures BOTH conditions, interleaved):
 //!   boot-bench \
-//!     --jailer-bin /path/to/jailer            (or landlock-jailer) \
-//!     --isolation chroot                      (or landlock -- see above) \
-//!     --condition chroot                      (free-text label for output) \
+//!     --jailer-bin-chroot /path/to/jailer \
+//!     --jailer-bin-landlock /path/to/landlock-jailer \
 //!     --exec-file /path/to/real/firecracker \
 //!     --kernel /path/to/vmlinux \
 //!     --rootfs /path/to/rootfs.ext4 \
 //!     --uid 123 --gid 100 \
 //!     --chroot-base-dir /srv/jailer-bench \
-//!     --cycles 50 --timeout-ms 5000 \
-//!     [--snapshot]
+//!     --cycles 600 --warmup-cycles 10 --timeout-ms 5000 \
+//!     [--snapshot] [--no-drop-caches]
 //!
-//! Output: one JSON line per cycle, e.g.
-//!   {"condition":"chroot","boot_time_us":83421,"cpu_boot_time_us":79102}
+//! Output: one JSON line per MEASURED cycle (warm-up cycles print nothing to
+//! stdout, only progress to stderr), e.g.
+//!   {"condition":"chroot","cycle":0,"wall_clock_us":812345,
+//!    "boot_time_us":83421,"cpu_boot_time_us":79102}
+//!   {"condition":"landlock","cycle":0,"wall_clock_us":934120,
+//!    "boot_time_us":71203,"cpu_boot_time_us":69884}
 //! or, with --snapshot:
-//!   {"condition":"chroot","boot_time_us":83421,"cpu_boot_time_us":79102,
+//!   {"condition":"chroot","cycle":0,"wall_clock_us":812345,
+//!    "boot_time_us":83421,"cpu_boot_time_us":79102,
 //!    "pause_ns":812004,"snapshot_create_ns":41220331,"resume_ns":95441}
 //! or on failure:
-//!   {"condition":"chroot","error":"..."}
+//!   {"condition":"chroot","cycle":0,"wall_clock_us":812345,"error":"..."}
 //!
-//! Extract fields the same way as setup-bench/fleet-churn-bench's driver
-//! scripts (grep -o '"boot_time_us":[0-9]*' | cut -d: -f2), then feed into
-//! open-bench analyze.
+//! `cycle` and `wall_clock_us` are the audit trail: split the single output
+//! stream by "condition" (same grep-based extraction as before, e.g.
+//! `grep -o '"boot_time_us":[0-9]*' | cut -d: -f2` per condition) and check
+//! that `wall_clock_us` interleaves between conditions rather than running
+//! as two contiguous blocks, before trusting the run as properly
+//! interleaved. Feed the split fields into open-bench analyze as before.
 
 use hyper::{Body, Client, Method, Request};
 use hyperlocal::UnixClientExt;
@@ -101,10 +85,21 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+// NOTE ON THIS REVISION: the previous version of this driver took a single
+// `--isolation chroot|landlock` and `--jailer-bin` pair, meaning a full
+// `--cycles N` run measured only one condition; getting both conditions
+// required two separate process invocations writing to two separate files.
+// That is a real methodological problem, not just an inconvenience: any
+// drift over the course of a run (thermal throttling, frequency scaling
+// settling, page-cache/dentry-cache warmth) then differs systematically
+// between the two files rather than being controlled for, and can produce a
+// "significant" gap between conditions that is actually just an artifact of
+// which file was captured first. This revision takes both jailer binaries
+// and interleaves chroot/Landlock cycles within a single process run (see
+// `main()`), so both conditions experience the same drift.
 struct Args {
-    jailer_bin: PathBuf,
-    isolation: String,
-    condition: String,
+    jailer_bin_chroot: PathBuf,
+    jailer_bin_landlock: PathBuf,
     exec_file: PathBuf,
     kernel: PathBuf,
     rootfs: PathBuf,
@@ -113,8 +108,19 @@ struct Args {
     gid: String,
     chroot_base_dir: PathBuf,
     cycles: u32,
+    /// Untimed cycles run per condition before measurement starts, and
+    /// discarded. Exists specifically to absorb one-time cold-start costs
+    /// (first vDSO touch, first page-cache population of the jailer/
+    /// Firecracker binaries, ...) so they don't land in cycle 0 of the
+    /// measured data and masquerade as a condition effect.
+    warmup_cycles: u32,
     timeout_ms: u64,
     snapshot: bool,
+    /// Drop the page cache before every measured cycle (both conditions).
+    /// Defaults to on; `--no-drop-caches` exists only for local iteration
+    /// where you don't have permission to write /proc/sys/vm/drop_caches --
+    /// never disable it for a run whose numbers are going in the thesis.
+    drop_caches: bool,
 }
 
 const DEFAULT_BOOT_ARGS: &str = "reboot=k panic=1 nomodule 8250.nr_uarts=0 \
@@ -124,18 +130,25 @@ const DEFAULT_BOOT_ARGS: &str = "reboot=k panic=1 nomodule 8250.nr_uarts=0 \
 fn usage_error(msg: &str) -> ! {
     eprintln!("{}", msg);
     eprintln!(
-        "usage: boot-bench --jailer-bin <path> --isolation <chroot|landlock> \
-         --condition <label> --exec-file <path> --kernel <path> --rootfs <path> \
+        "usage: boot-bench --jailer-bin-chroot <path> --jailer-bin-landlock <path> \
+         --exec-file <path> --kernel <path> --rootfs <path> \
          --uid <uid> --gid <gid> --chroot-base-dir <dir> [--boot-args <args>] \
-         [--cycles N] [--timeout-ms N] [--snapshot]"
+         [--cycles N] [--warmup-cycles N] [--timeout-ms N] [--snapshot] \
+         [--no-drop-caches]\n\
+         \n\
+         Each measured cycle runs BOTH conditions back to back (chroot then \
+         landlock), and cycles are what get interleaved -- this is what \
+         replaces the old two-separate-invocations workflow. Do not run this \
+         binary twice with a single-condition flag anymore; that flag no \
+         longer exists, specifically to make the non-interleaved workflow \
+         impossible to accidentally fall back into."
     );
     std::process::exit(2);
 }
 
 fn parse_args() -> Args {
-    let mut jailer_bin = None;
-    let mut isolation = None;
-    let mut condition = None;
+    let mut jailer_bin_chroot = None;
+    let mut jailer_bin_landlock = None;
     let mut exec_file = None;
     let mut kernel = None;
     let mut rootfs = None;
@@ -144,8 +157,10 @@ fn parse_args() -> Args {
     let mut gid = None;
     let mut chroot_base_dir = None;
     let mut cycles = 50u32;
+    let mut warmup_cycles = 10u32;
     let mut timeout_ms = 5000u64;
     let mut snapshot = false;
+    let mut drop_caches = true;
 
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
@@ -154,9 +169,8 @@ fn parse_args() -> Args {
                 .unwrap_or_else(|| usage_error(&format!("missing value for {}", flag)))
         };
         match flag.as_str() {
-            "--jailer-bin" => jailer_bin = Some(PathBuf::from(next_val())),
-            "--isolation" => isolation = Some(next_val()),
-            "--condition" => condition = Some(next_val()),
+            "--jailer-bin-chroot" => jailer_bin_chroot = Some(PathBuf::from(next_val())),
+            "--jailer-bin-landlock" => jailer_bin_landlock = Some(PathBuf::from(next_val())),
             "--exec-file" => exec_file = Some(PathBuf::from(next_val())),
             "--kernel" => kernel = Some(PathBuf::from(next_val())),
             "--rootfs" => rootfs = Some(PathBuf::from(next_val())),
@@ -169,28 +183,38 @@ fn parse_args() -> Args {
                     .parse()
                     .unwrap_or_else(|_| usage_error("bad --cycles"))
             }
+            "--warmup-cycles" => {
+                warmup_cycles = next_val()
+                    .parse()
+                    .unwrap_or_else(|_| usage_error("bad --warmup-cycles"))
+            }
             "--timeout-ms" => {
                 timeout_ms = next_val()
                     .parse()
                     .unwrap_or_else(|_| usage_error("bad --timeout-ms"))
             }
             "--snapshot" => snapshot = true,
+            "--no-drop-caches" => drop_caches = false,
+            // Deliberately rejected rather than silently ignored: these are
+            // the old single-condition flags. Erroring here (instead of, say,
+            // quietly accepting --isolation and doing the wrong thing) is the
+            // whole point -- it should be structurally impossible to
+            // accidentally fall back to the old non-interleaved workflow.
+            "--isolation" | "--condition" | "--jailer-bin" => usage_error(&format!(
+                "{} was removed -- use --jailer-bin-chroot and \
+                 --jailer-bin-landlock; every run now measures both \
+                 conditions interleaved, in one invocation",
+                flag
+            )),
             other => usage_error(&format!("unknown flag {}", other)),
         }
     }
 
-    let isolation = isolation.unwrap_or_else(|| usage_error("--isolation required (chroot|landlock)"));
-    if isolation != "chroot" && isolation != "landlock" {
-        usage_error(&format!(
-            "--isolation must be \"chroot\" or \"landlock\", got {:?}",
-            isolation
-        ));
-    }
-
     Args {
-        jailer_bin: jailer_bin.unwrap_or_else(|| usage_error("--jailer-bin required")),
-        isolation,
-        condition: condition.unwrap_or_else(|| usage_error("--condition required")),
+        jailer_bin_chroot: jailer_bin_chroot
+            .unwrap_or_else(|| usage_error("--jailer-bin-chroot required")),
+        jailer_bin_landlock: jailer_bin_landlock
+            .unwrap_or_else(|| usage_error("--jailer-bin-landlock required")),
         exec_file: exec_file.unwrap_or_else(|| usage_error("--exec-file required")),
         kernel: kernel.unwrap_or_else(|| usage_error("--kernel required")),
         rootfs: rootfs.unwrap_or_else(|| usage_error("--rootfs required")),
@@ -200,13 +224,20 @@ fn parse_args() -> Args {
         chroot_base_dir: chroot_base_dir
             .unwrap_or_else(|| usage_error("--chroot-base-dir required")),
         cycles,
+        warmup_cycles,
         timeout_ms,
         snapshot,
+        drop_caches,
     }
 }
 
-fn spawn_jailer(args: &Args, id: &str, log_path: &Path) -> std::io::Result<Child> {
-    Command::new(&args.jailer_bin)
+fn spawn_jailer(
+    args: &Args,
+    jailer_bin: &Path,
+    id: &str,
+    log_path: &Path,
+) -> std::io::Result<Child> {
+    Command::new(jailer_bin)
         .arg("--id")
         .arg(id)
         .arg("--exec-file")
@@ -386,9 +417,6 @@ async fn pause_snapshot_resume(
     })
 }
 
-/// Identical regex to your test_boottime.py's timestamp_log_regex. Group 1
-/// is boot_time_us, group 3 is boot_time_cpu_us -- same groups your
-/// Python's `boot_time_us, _, boot_time_cpu_us, _ = timestamps[0]` picks.
 fn wait_for_boot_time(
     log_path: &Path,
     timeout: Duration,
@@ -413,6 +441,33 @@ fn wait_for_boot_time(
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Drops the page cache before a measured cycle. Requires root and a
+/// writable /proc/sys/vm/drop_caches -- both already required elsewhere in
+/// this harness (jailer itself needs root for chown/mknod).
+///
+/// Fails closed, matching this codebase's existing convention for isolation
+/// guarantees (see `landlock.rs`'s hard failure on
+/// `RulesetStatus::NotEnforced`): if we can't confirm the cache was actually
+/// dropped, silently continuing would let stale cache state leak between
+/// cycles undetected, defeating the entire reason this call exists. Better
+/// to abort the run loudly than to produce numbers with the same silent
+/// confound this revision was written to eliminate.
+fn drop_caches() -> Result<(), String> {
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg("sync && echo 3 > /proc/sys/vm/drop_caches")
+        .status()
+        .map_err(|e| format!("failed to spawn drop_caches command: {}", e))?;
+    if !status.success() {
+        return Err(format!(
+            "drop_caches command exited with {} -- are we running as root, \
+             and is /proc/sys/vm/drop_caches writable?",
+            status
+        ));
+    }
+    Ok(())
 }
 
 fn teardown(child: &mut Child) {
@@ -454,7 +509,13 @@ fn api_path_for(isolation: &str, jail_root: &Path, fixed_name: &str) -> String {
     }
 }
 
-fn run_one_cycle(args: &Args, id: &str, rt: &tokio::runtime::Runtime) -> Result<CycleResult, String> {
+fn run_one_cycle(
+    args: &Args,
+    isolation: &str,
+    jailer_bin: &Path,
+    id: &str,
+    rt: &tokio::runtime::Runtime,
+) -> Result<CycleResult, String> {
     let vm_dir = args
         .chroot_base_dir
         .join(args.exec_file.file_name().unwrap())
@@ -470,7 +531,7 @@ fn run_one_cycle(args: &Args, id: &str, rt: &tokio::runtime::Runtime) -> Result<
         .map_err(|e| format!("failed to pre-create run dir: {}", e))?;
     std::fs::write(&log_path, "").map_err(|e| format!("failed to pre-create log file: {}", e))?;
 
-      // Copy kernel+rootfs into jail_root for BOTH conditions -- see this
+    // Copy kernel+rootfs into jail_root for BOTH conditions, see this
     // file's top comment for why this must happen uniformly, not just for
     // chroot. Safe to do before spawning jailer: chroot's bind-mount-over-
     // itself preserves whatever's already in jail_root (same precedent as
@@ -495,12 +556,12 @@ fn run_one_cycle(args: &Args, id: &str, rt: &tokio::runtime::Runtime) -> Result<
     }
 
 
-    let kernel_path_for_api = api_path_for(&args.isolation, &jail_root, "vmlinux");
-    let rootfs_path_for_api = api_path_for(&args.isolation, &jail_root, "rootfs.ext4");
+    let kernel_path_for_api = api_path_for(isolation, &jail_root, "vmlinux");
+    let rootfs_path_for_api = api_path_for(isolation, &jail_root, "rootfs.ext4");
 
     // Use jail-relative path for chroot, host-absolute for Landlock
-    let log_path_for_fc = api_path_for(&args.isolation, &jail_root, "run/firecracker.log");
-    let mut child = spawn_jailer(args, id, Path::new(&log_path_for_fc))
+    let log_path_for_fc = api_path_for(isolation, &jail_root, "run/firecracker.log");
+    let mut child = spawn_jailer(args, jailer_bin, id, Path::new(&log_path_for_fc))
         .map_err(|e| format!("spawn failed: {}", e))?;
 
     let result = (|| -> Result<CycleResult, String> {
@@ -515,8 +576,8 @@ fn run_one_cycle(args: &Args, id: &str, rt: &tokio::runtime::Runtime) -> Result<
             wait_for_boot_time(&log_path, Duration::from_millis(args.timeout_ms), &mut child)?;
 
         let snapshot = if args.snapshot {
-            let snapshot_path_for_api = api_path_for(&args.isolation, &jail_root, "snapshot_file");
-            let mem_file_path_for_api = api_path_for(&args.isolation, &jail_root, "mem_file");
+            let snapshot_path_for_api = api_path_for(isolation, &jail_root, "snapshot_file");
+            let mem_file_path_for_api = api_path_for(isolation, &jail_root, "mem_file");
             Some(rt.block_on(pause_snapshot_resume(
                 &socket_path,
                 &snapshot_path_for_api,
@@ -539,30 +600,117 @@ fn run_one_cycle(args: &Args, id: &str, rt: &tokio::runtime::Runtime) -> Result<
     result
 }
 
+/// One measured attempt: drop caches (if enabled), run the cycle, print a
+/// JSON line carrying `cycle` and `wall_clock_us` alongside the existing
+/// fields. Those two fields are the audit trail: they let interleaving be
+/// verified directly from the output file after the fact (e.g. checking
+/// that wall_clock_us is monotonically increasing and that cycle indices
+/// for both conditions are interleaved, not one block then the other)
+/// rather than resting on a claim in the methods section.
+fn run_measured_cycle(
+    args: &Args,
+    isolation: &str,
+    jailer_bin: &Path,
+    cycle: u32,
+    program_start: &Instant,
+    rt: &tokio::runtime::Runtime,
+) {
+    if args.drop_caches {
+        if let Err(e) = drop_caches() {
+            eprintln!(
+                "[boot-bench] FATAL at cycle {} ({}): {}",
+                cycle, isolation, e
+            );
+            eprintln!(
+                "[boot-bench] aborting rather than silently continuing without \
+                 cache-drop guarantees -- partial output above should NOT be \
+                 treated as a valid interleaved run"
+            );
+            std::process::exit(1);
+        }
+    }
+
+    let wall_clock_us = program_start.elapsed().as_micros();
+    let id = format!("boot-{}-{}-{}", std::process::id(), isolation, cycle);
+
+    match run_one_cycle(args, isolation, jailer_bin, &id, rt) {
+        Ok(result) => {
+            let mut out = format!(
+                "{{\"condition\":\"{}\",\"cycle\":{},\"wall_clock_us\":{},\
+                 \"boot_time_us\":{},\"cpu_boot_time_us\":{}",
+                isolation, cycle, wall_clock_us, result.boot_us, result.cpu_us
+            );
+            if let Some(snap) = result.snapshot {
+                out.push_str(&format!(
+                    ",\"pause_ns\":{},\"snapshot_create_ns\":{},\"resume_ns\":{}",
+                    snap.pause_ns, snap.snapshot_create_ns, snap.resume_ns
+                ));
+            }
+            out.push('}');
+            println!("{}", out);
+        }
+        Err(e) => {
+            println!(
+                "{{\"condition\":\"{}\",\"cycle\":{},\"wall_clock_us\":{},\"error\":\"{}\"}}",
+                isolation, cycle, wall_clock_us, e
+            );
+        }
+    }
+}
+
 fn main() {
     let args = parse_args();
     let rt = tokio::runtime::Runtime::new().expect("failed to build tokio runtime");
+    let program_start = Instant::now();
 
-    for cycle in 0..args.cycles {
-        let id = format!("boot-{}-{}", std::process::id(), cycle);
-        match run_one_cycle(&args, &id, &rt) {
-            Ok(result) => {
-                let mut out = format!(
-                    "{{\"condition\":\"{}\",\"boot_time_us\":{},\"cpu_boot_time_us\":{}",
-                    args.condition, result.boot_us, result.cpu_us
-                );
-                if let Some(snap) = result.snapshot {
-                    out.push_str(&format!(
-                        ",\"pause_ns\":{},\"snapshot_create_ns\":{},\"resume_ns\":{}",
-                        snap.pause_ns, snap.snapshot_create_ns, snap.resume_ns
-                    ));
-                }
-                out.push('}');
-                println!("{}", out);
-            }
-            Err(e) => {
-                println!("{{\"condition\":\"{}\",\"error\":\"{}\"}}", args.condition, e);
-            }
+    // Untimed warm-up, both conditions, fully discarded (nothing printed).
+    // Absorbs one-time cold-start costs -- first vDSO touch, first
+    // page-cache population of the jailer/Firecracker/kernel/rootfs files,
+    // any lazy kernel-side initialization -- that would otherwise land in
+    // cycle 0 of the measured data and could produce exactly the kind of
+    // single-outlier artifact seen in the previous (non-interleaved) run.
+    eprintln!(
+        "[boot-bench] warm-up: {} cycles per condition (discarded, not printed)",
+        args.warmup_cycles
+    );
+    for w in 0..args.warmup_cycles {
+        let id_c = format!("warmup-chroot-{}-{}", std::process::id(), w);
+        if let Err(e) = run_one_cycle(&args, "chroot", &args.jailer_bin_chroot, &id_c, &rt) {
+            eprintln!("[boot-bench] warm-up cycle {} (chroot) failed: {}", w, e);
         }
+        let id_l = format!("warmup-landlock-{}-{}", std::process::id(), w);
+        if let Err(e) = run_one_cycle(&args, "landlock", &args.jailer_bin_landlock, &id_l, &rt) {
+            eprintln!("[boot-bench] warm-up cycle {} (landlock) failed: {}", w, e);
+        }
+    }
+
+    eprintln!(
+        "[boot-bench] warm-up complete; starting {} interleaved measured cycles \
+         (chroot, landlock per cycle)",
+        args.cycles
+    );
+
+    // Measured, interleaved ABAB. Within a cycle the order is always
+    // chroot-then-landlock (deterministic, not randomized), what actually
+    // controls for drift is interleaving across cycles rather than running
+    // all of one condition and then all of the other, not the order within
+    // a single cycle.
+    for cycle in 0..args.cycles {
+        run_measured_cycle(
+            &args,
+            "chroot",
+            &args.jailer_bin_chroot,
+            cycle,
+            &program_start,
+            &rt,
+        );
+        run_measured_cycle(
+            &args,
+            "landlock",
+            &args.jailer_bin_landlock,
+            cycle,
+            &program_start,
+            &rt,
+        );
     }
 }

@@ -1,23 +1,17 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Idea #2: fleet-churn boot latency.
-//!
 //! Architecturally distinct from setup-bench's modes: those call into
 //! `Env`/`setup_isolation` directly and never actually exec Firecracker.
 //! This one spawns the real, unmodified `jailer`/`landlock-jailer` binaries
 //! as external child processes with a real Firecracker `--exec-file`, and
 //! measures wall-clock time from process spawn to the moment Firecracker's
-//! API socket becomes connectable -- the earliest externally observable
-//! milestone downstream of isolation setup, chosen deliberately to avoid
-//! diluting the signal with guest kernel boot time (hundreds of ms, which
-//! would swamp any isolation-mechanism difference measured in µs). This
-//! does NOT boot a guest: no kernel/rootfs is configured, no
-//! InstanceStart action is sent, so nothing past Firecracker's own HTTP
-//! server startup is measured.
+//! API socket becomes connectable, This does NOT boot a guest: no
+//! kernel/rootfs is configured, no InstanceStart action is sent,
+//! so nothing past Firecracker's own HTTP server startup is measured.
 //!
 //! It intentionally links against neither `jailer`'s library nor `utils`
-//! -- it never constructs an `Env`, it just shells out to whichever real
+//! as it never constructs an `Env`, it just shells out to whichever real
 //! binary path you give it, the same way an orchestrator would in
 //! production. This is what makes it a fair test of the *actual*
 //! `jailer`/`landlock-jailer` binaries rather than a reimplementation.

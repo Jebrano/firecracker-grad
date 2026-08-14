@@ -9,7 +9,7 @@
 //! `jailer` library those two binaries use (`Env`, `Isolation`,
 //! `build_arg_parser`) and calls `Env::run_setup_only()`, which shares its
 //! entire setup implementation with production `Env::run()` via the private
-//! `setup_isolation` method in env.rs -- so this binary can't silently drift
+//! `setup_isolation` method in env.rs, so this binary can't silently drift
 //! from what `jailer`/`landlock-jailer` actually do, without needing to be
 //! part of either of them.
 //!
@@ -19,8 +19,8 @@
 //!                     phase exactly once, prints one JSON line of phase
 //!                     timings, exits. Never execs --exec-file.
 //!
-//!   multi-file-open   Runs the same setup phase, then -- from inside the
-//!                     now-restricted process -- opens a realistic set of
+//!   multi-file-open   Runs the same setup phase, then from inside the
+//!                     now-restricted process, opens a realistic set of
 //!                     files (kernel image, rootfs, metrics FIFO, log,
 //!                     /dev/kvm, /dev/net/tun), timing each open
 //!                     individually, and prints setup phases plus per-file
@@ -36,9 +36,9 @@
 //! All flags other than --isolation/--mode are exactly jailer's own flags
 //! (this binary builds its parser by extending `jailer::build_arg_parser()`),
 //! so --exec-file must point at a real, readable regular file (existing
-//! validation requires it) even though it's never exec'd. `multi-file-open`
-//! stages every fixture file it opens -- including the /run directory, the
-//! metrics FIFO, and the log file -- *before* isolation is applied, not
+//! validation requires it) even though it's never exec'd. multi-file-open
+//! stages every fixture file it opens, including the /run directory, the
+//! metrics FIFO, and the log file *before* isolation is applied, not
 //! after: mkfifo() specifically needs Landlock's MakeFifo access right,
 //! which jail_root's rule deliberately doesn't grant (real deployments
 //! stage the metrics FIFO before the jailed process runs; it never creates
@@ -162,23 +162,6 @@ fn run_setup_mode(env: Env, isolation: Isolation) -> Result<(), JailerError> {
     Ok(())
 }
 
-/// Idea #5: realistic multi-file jail setup. Times a *sequence* of opens
-/// against the kind of files a real Firecracker instance actually touches
-/// at boot, from inside the process *after* isolation has been applied --
-/// same rationale as `run_setup_only`, just extended one step further
-/// instead of exiting right after setup.
-///
-/// All fixture files -- including `/run` and the metrics FIFO -- are
-/// created *before* `run_setup_only` (before chroot's pivot_root /
-/// Landlock's restrict_self), not after: a bind-mount-over-itself (chroot)
-/// preserves whatever's already there regardless of nesting, and
-/// Landlock's jail_root `PathBeneath` rule already covers *opening*
-/// anything under it, so no landlock.rs changes are needed for any of
-/// this. Creating the FIFO specifically has to happen before restriction
-/// takes effect: mkfifo() needs Landlock's MakeFifo right, which
-/// jail_root's rule intentionally doesn't grant, mirroring how a real
-/// deployment's orchestrator stages the metrics FIFO ahead of time rather
-/// than having the jailed process create it.
 fn run_multi_file_open_mode(env: Env, isolation: Isolation) -> Result<(), JailerError> {
     // All fixtures are created here, before run_setup_only() -- i.e. before
     // chroot's pivot_root or Landlock's restrict_self() take effect -- and
@@ -240,7 +223,7 @@ fn run_multi_file_open_mode(env: Env, isolation: Isolation) -> Result<(), Jailer
         return Err(JailerError::FileOpen(run_dir.clone(), std::io::Error::last_os_error()));
     }
 
-    // (dir_fd, filename, display_label) -- display_label is what shows up in
+    // (dir_fd, filename, display_label), display_label is what shows up in
     // the JSON output, kept as a plain filename now that path depth is no
     // longer part of what's being measured for these four.
     let relative_probes: [(libc::c_int, &str); 4] = [
