@@ -759,8 +759,7 @@ impl Env {
         // We have to setup cgroups at this point, because the chroot backend can't do
         // it anymore after chrooting. The Landlock backend has no such constraint, but
         // we do it here regardless so cgroup setup happens at an identical point in
-        // both binaries -- deliberately, to avoid this ordering becoming a confound in
-        // the benchmark comparison.
+        // both binaries.
         if let Some(ref conf) = self.cgroup_conf {
             conf.setup()?;
             checkpoint!("cgroup_setup");

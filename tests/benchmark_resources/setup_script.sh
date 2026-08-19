@@ -37,13 +37,20 @@ sudo pkill -f "firecracker|cargo|rustc" 2>/dev/null || true
 # Drop page cache — do this as close to VM boot as possible
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 
-# CPU governor
-sudo cpupower frequency-set -g performance
-echo "Governor: $(cpupower frequency-info -p | grep 'The governor')"
+# Disable turbo boost. Some of our tests are performance tests, and we want minimum variability wrt processor frequency
+# See also https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/processor_state_control.html
+echo 1 |sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo &> /dev/null
 
-# Disable turbo boost (Intel)
-echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo
-echo "Turbo boost disabled: $(cat /sys/devices/system/cpu/intel_pstate/no_turbo)"
+# Force the CPU to continuously stay in the highest, non-turbo P-state. The P-state will determine the
+# CPU's clock frequency.
+# https://www.kernel.org/doc/html/v4.12/admin-guide/pm/intel_pstate.html
+echo 100 |sudo tee /sys/devices/system/cpu/intel_pstate/min_perf_pct &> /dev/null
+echo 100 |sudo tee /sys/devices/system/cpu/intel_pstate/max_perf_pct &> /dev/null
+
+# The governor is a linux component that can adjust CPU frequency. "performance" tells it to always run CPUs at
+# their maximum safe frequency. It seems to be the default for Amazon Linux, but it doesn't hurt to make this explicit.
+# See also https://wiki.archlinux.org/title/CPU_frequency_scaling
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor &> /dev/null
 
 # Disable ASLR
 echo 0 | sudo tee /proc/sys/kernel/randomize_va_space
