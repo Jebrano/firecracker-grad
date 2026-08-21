@@ -23,7 +23,6 @@ use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
 use zerocopy::IntoBytes;
 
-use crate::Vm;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_ids;
 use crate::devices::virtio::queue::Queue;
@@ -46,7 +45,7 @@ use crate::snapshot::Persist;
 use crate::vstate::bus::BusDevice;
 use crate::vstate::interrupts::{InterruptError, MsixVectorGroup};
 use crate::vstate::memory::GuestMemoryMmap;
-use crate::vstate::resources::ResourceAllocator;
+use crate::vstate::vm::KvmVm;
 
 /// Vector value used to disable MSI for a queue.
 pub const VIRTQ_MSI_NO_VECTOR: u16 = 0xffff;
@@ -245,6 +244,7 @@ pub struct VirtioPciDeviceState {
     pub msix_state: MsixConfigState,
     pub bars: Bars,
     pub msix_config_cap_offset: u16,
+    pub bar_address: u64,
 }
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -253,6 +253,10 @@ pub enum VirtioPciDeviceError {
     Msi(#[from] InterruptError),
     /// Invalid PCI configuration state: {0}
     PciConfiguration(#[from] PciConfigurationError),
+    /// Invalid restore state: driver_status {0:#x} is inconsistent with device_activated (expected {1:#x})
+    InvalidRestoreState(u8, u8),
+    /// Restored MSI-X vector count ({0}) does not match the expected count ({1}) for this device
+    UnexpectedMsixVectorCount(usize, usize),
 }
 
 pub struct VirtioPciDevice {
@@ -281,6 +285,16 @@ pub struct VirtioPciDevice {
 
     // Guest memory
     memory: GuestMemoryMmap,
+
+    // GPA base at which the capability BAR is currently mapped on the
+    // mmio bus, and where the notification ioeventfds are registered.
+    // 0 means unmapped
+    //
+    // It is not necessarily equal to `config_bar_addr()`: the latter reflects
+    // whatever the guest has last written into the BAR registers, which may be
+    // transient (a 64-bit BAR is programmed with two separate writes) or not
+    // yet in effect.
+    bar_address: u64,
 
     // Add a dedicated structure to hold information about the very specific
     // virtio-pci capability VIRTIO_PCI_CAP_PCI_CFG. This is needed to support
@@ -344,7 +358,7 @@ impl VirtioPciDevice {
 
         // Allocate the virtio-pci capability BAR.
         // See http://docs.oasis-open.org/virtio/virtio/v1.0/cs04/virtio-v1.0-cs04.html#x1-740004
-        let virtio_pci_bar_addr = mmio64_allocator
+        self.bar_address = mmio64_allocator
             .allocate(
                 CAPABILITY_BAR_SIZE,
                 CAPABILITY_BAR_SIZE,
@@ -354,7 +368,7 @@ impl VirtioPciDevice {
             .start();
         self.bars.set_bar_64(
             VIRTIO_BAR_INDEX,
-            virtio_pci_bar_addr,
+            self.bar_address,
             CAPABILITY_BAR_SIZE,
             BarPrefetchable::No,
         );
@@ -368,8 +382,9 @@ impl VirtioPciDevice {
         device: Arc<Mutex<dyn VirtioDevice>>,
         msix_vectors: Arc<MsixVectorGroup>,
         sbdf: PciSBDF,
-    ) -> Result<Self, VirtioPciDeviceError> {
+    ) -> Self {
         let num_queues = device.lock().expect("Poisoned lock").queues().len();
+        assert_eq!(msix_vectors.vectors.len(), num_queues + 1);
 
         let msix_config = Arc::new(Mutex::new(MsixConfig::new(msix_vectors.clone(), sbdf)));
         let pci_config = Self::pci_configuration(
@@ -393,7 +408,7 @@ impl VirtioPciDevice {
             msix_vectors,
         ));
 
-        let virtio_pci_device = VirtioPciDevice {
+        VirtioPciDevice {
             id,
             sub_id: None,
             sbdf,
@@ -403,27 +418,51 @@ impl VirtioPciDevice {
             device_activated: Arc::new(AtomicBool::new(false)),
             virtio_interrupt: Some(interrupt),
             memory,
+            bar_address: 0,
             cap_pci_cfg_info: VirtioPciCfgCapInfo::default(),
             bars: Bars::default(),
             msix_config,
             msix_config_cap_offset: 0,
-        };
-
-        Ok(virtio_pci_device)
+        }
     }
 
     pub fn new_from_state(
         id: String,
-        vm: &Arc<Vm>,
+        vm: &Arc<KvmVm>,
         device: Arc<Mutex<dyn VirtioDevice>>,
         state: VirtioPciDeviceState,
     ) -> Result<Self, VirtioPciDeviceError> {
         let msix_config = MsixConfig::from_state(state.msix_state, vm.clone(), state.sbdf)?;
         let vectors = msix_config.vectors.clone();
+
+        // Expecting one vector per queue, plus one for the configuration
+        let expected_num_vectors = device.lock().expect("Poisoned lock").queues().len() + 1;
+        if vectors.vectors.len() != expected_num_vectors {
+            return Err(VirtioPciDeviceError::UnexpectedMsixVectorCount(
+                vectors.vectors.len(),
+                expected_num_vectors,
+            ));
+        }
+
         let msix_config = Arc::new(Mutex::new(msix_config));
 
         let pci_config = PciConfiguration::type0_from_state(state.pci_configuration_state)?;
         let virtio_common_config = VirtioPciCommonConfig::new(state.pci_dev_state);
+
+        if state.device_activated {
+            let driver_ok = ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK;
+            // The reset code path leaves the backend active while setting
+            // driver_status to 0 (INIT), so INIT is also valid
+            let valid = virtio_common_config.driver_status == driver_ok
+                || virtio_common_config.driver_status == INIT;
+            if !valid {
+                return Err(VirtioPciDeviceError::InvalidRestoreState(
+                    virtio_common_config.driver_status,
+                    driver_ok,
+                ));
+            }
+        }
+
         let cap_pci_cfg_info = VirtioPciCfgCapInfo {
             offset: state.cap_pci_cfg_offset,
             cap: *VirtioPciCfgCap::from_slice(&state.cap_pci_cfg).ok_or(
@@ -438,7 +477,7 @@ impl VirtioPciDevice {
             vectors,
         ));
 
-        let mut virtio_pci_device = VirtioPciDevice {
+        let virtio_pci_device = VirtioPciDevice {
             id,
             sub_id: None,
             sbdf: state.sbdf,
@@ -448,6 +487,7 @@ impl VirtioPciDevice {
             device_activated: Arc::new(AtomicBool::new(state.device_activated)),
             virtio_interrupt: Some(interrupt),
             memory: vm.guest_memory().clone(),
+            bar_address: state.bar_address,
             cap_pci_cfg_info,
             bars: state.bars,
             msix_config,
@@ -468,6 +508,16 @@ impl VirtioPciDevice {
         Ok(virtio_pci_device)
     }
 
+    /// Enable unmasked MSI-X vectors by registering IRQFDs with KVM.
+    ///
+    /// Must be called after the GSI routes have been set up (see [KvmVm::set_gsi_routes]).
+    pub fn enable_unmasked_vectors(&self) -> Result<(), InterruptError> {
+        self.msix_config
+            .lock()
+            .expect("Poisoned lock")
+            .enable_unmasked_vectors()
+    }
+
     fn is_driver_ready(&self) -> bool {
         let ready_bits = (ACKNOWLEDGE | DRIVER | DRIVER_OK | FEATURES_OK);
         self.common_config.driver_status == ready_bits
@@ -478,8 +528,19 @@ impl VirtioPciDevice {
         self.common_config.driver_status == INIT
     }
 
+    /// GPA base currently written in the BAR register.
+    ///
+    /// Might be different from bar_address() during BAR relocation.
     pub fn config_bar_addr(&self) -> u64 {
         self.bars.get_bar_addr_64(VIRTIO_BAR_INDEX)
+    }
+
+    /// GPA base at which the capability BAR is currently mapped on the
+    /// mmio bus, and where the notification ioeventfds are registered.
+    ///
+    /// Might be different from config_bar_addr() during BAR relocation.
+    pub fn bar_address(&self) -> u64 {
+        self.bar_address
     }
 
     fn add_pci_capabilities(&mut self) {
@@ -603,9 +664,12 @@ impl VirtioPciDevice {
         !self.device_activated.load(Ordering::SeqCst) && self.is_driver_ready()
     }
 
-    /// Register the IoEvent notification for a VirtIO device
-    pub fn register_notification_ioevent(&self, vm: &Vm) -> Result<(), errno::Error> {
-        let bar_addr = self.config_bar_addr();
+    fn set_notification_ioevents(
+        &self,
+        vm: &KvmVm,
+        bar_addr: u64,
+        assign: bool,
+    ) -> Result<(), errno::Error> {
         for (i, queue_evt) in self
             .device
             .lock()
@@ -617,9 +681,86 @@ impl VirtioPciDevice {
             let notify_base = bar_addr + u64::from(NOTIFICATION_BAR_OFFSET);
             let io_addr =
                 IoEventAddress::Mmio(notify_base + i as u64 * u64::from(NOTIFY_OFF_MULTIPLIER));
-            vm.fd().register_ioevent(queue_evt, &io_addr, NoDatamatch)?;
+            if assign {
+                vm.fd().register_ioevent(queue_evt, &io_addr, NoDatamatch)?;
+            } else {
+                vm.fd()
+                    .unregister_ioevent(queue_evt, &io_addr, NoDatamatch)?;
+            }
         }
         Ok(())
+    }
+
+    /// Register the IoEvent notifications for a VirtIO device.
+    pub fn register_notification_ioevents(&self, vm: &KvmVm) -> Result<(), errno::Error> {
+        self.set_notification_ioevents(vm, self.bar_address, true)
+    }
+
+    /// Unregister the IoEvent notifications for a VirtIO device.
+    pub fn unregister_notification_ioevents(&self, vm: &KvmVm) -> Result<(), errno::Error> {
+        self.set_notification_ioevents(vm, self.bar_address, false)
+    }
+
+    /// Tear down the MSI-X configuration. Used on device reset.
+    fn reset_msix(&mut self) {
+        let (num_vectors, vm) = {
+            let msix_config = self.msix_config.lock().expect("Poisoned lock");
+            (
+                msix_config.vectors.num_vectors(),
+                msix_config.vectors.vm.clone(),
+            )
+        };
+
+        // Build a fresh MSI-X vector group and configuration.
+        let msix_vectors = match KvmVm::create_msix_group(vm.clone(), num_vectors) {
+            Ok(vectors) => Arc::new(vectors),
+            Err(err) => {
+                error!("Failed to recreate MSI-X vector group on reset: {err:?}");
+                return;
+            }
+        };
+
+        self.common_config
+            .msix_config
+            .store(VIRTQ_MSI_NO_VECTOR, Ordering::Release);
+        for vector in self
+            .common_config
+            .msix_queues
+            .lock()
+            .expect("Poisoned lock")
+            .iter_mut()
+        {
+            *vector = VIRTQ_MSI_NO_VECTOR;
+        }
+
+        let msix_config = Arc::new(Mutex::new(MsixConfig::new(msix_vectors.clone(), self.sbdf)));
+        let interrupt = Arc::new(VirtioInterruptMsix::new(
+            msix_config.clone(),
+            self.common_config.msix_config.clone(),
+            self.common_config.msix_queues.clone(),
+            msix_vectors,
+        ));
+
+        // Dropping the previous virtio_interrupt and msix_config releases the
+        // last references to the old MsixVectorGroup, whose Drop unregisters
+        // the irqfds, removes the GSI routes from the routing table and frees
+        // the GSIs.
+        self.virtio_interrupt = Some(interrupt);
+        self.msix_config = msix_config;
+
+        // Flush the updated routing table
+        if let Err(err) = vm.set_gsi_routes() {
+            error!("Failed to update GSI routes after MSI-X reset: {err:?}");
+        }
+
+        // Clear the MSI-X Enable and Function Mask bits in the guest-visible
+        // PCI capability so config-space reads stay consistent with the
+        // freshly-reset MsixConfig.
+        let reg_idx = self.msix_config_cap_offset / 4;
+        let msg_ctl = (self.configuration.read_reg(reg_idx) >> 16) as u16;
+        let msg_ctl = msg_ctl & !((1 << 15) | (1 << 14)); // clear Enable + Function Mask
+        self.configuration
+            .write_config_register(reg_idx, 2, &msg_ctl.to_le_bytes());
     }
 
     pub fn state(&self) -> VirtioPciDeviceState {
@@ -640,6 +781,7 @@ impl VirtioPciDevice {
                 .state(),
             bars: self.bars,
             msix_config_cap_offset: self.msix_config_cap_offset,
+            bar_address: self.bar_address,
         }
     }
 }
@@ -923,13 +1065,18 @@ impl PciDevice for VirtioPciDevice {
         if self.needs_activation() {
             debug!("Activating device");
             let interrupt = Arc::clone(self.virtio_interrupt.as_ref().unwrap());
-            match self
-                .virtio_device()
-                .lock()
-                .unwrap()
-                .activate(self.memory.clone(), interrupt.clone())
-            {
-                Ok(()) => self.device_activated.store(true, Ordering::SeqCst),
+            let device = self.virtio_device();
+            let mut locked_device = device.lock().unwrap();
+            match locked_device.activate(self.memory.clone(), interrupt.clone()) {
+                Ok(()) => {
+                    self.device_activated.store(true, Ordering::SeqCst);
+
+                    // A queue notification may have arrived after the guest set DRIVER_OK but
+                    // before the device finished activating, in which case it was discarded as
+                    // spurious. Re-notify the queues so any buffers the guest already made
+                    // available get processed.
+                    locked_device.notify_queue_events();
+                }
                 Err(err) => {
                     self.common_config.driver_status |= DEVICE_NEEDS_RESET;
                     error!("Error activating device: {err:?}");
@@ -943,42 +1090,32 @@ impl PciDevice for VirtioPciDevice {
 
         // Device has been reset by the driver
         if self.device_activated.load(Ordering::SeqCst) && self.is_driver_init() {
-            let mut device = self.device.lock().unwrap();
-            let reset_result = device.reset();
-            match reset_result {
-                Some(_) => {
-                    // Upon reset the device returns its interrupt EventFD
-                    self.virtio_interrupt = None;
-                    self.device_activated.store(false, Ordering::SeqCst);
+            let reset_succeeded = self.device.lock().unwrap().reset();
+            if reset_succeeded {
+                self.device_activated.store(false, Ordering::SeqCst);
 
-                    // Reset queue readiness (changes queue_enable), queue sizes
-                    // and selected_queue as per spec for reset
-                    self.virtio_device()
-                        .lock()
-                        .unwrap()
-                        .queues_mut()
-                        .iter_mut()
-                        .for_each(Queue::reset);
-                    self.common_config.queue_select = 0;
-                }
-                None => {
-                    error!("Attempt to reset device when not implemented in underlying device");
-                    // The virtio spec does not specify what to do if reset fails.
-                    //
-                    // Our MMIO transport sets FAILED in this case, but we must NOT do that for PCI.
-                    // During shutdown, the Linux kernel issues a reset to each virtio device.  The
-                    // virtio PCI driver then polls device_status until it reads back 0, unlike the
-                    // virtio MMIO driver which simply writes 0 and returns.  Setting FAILED would
-                    // cause the poll to spin forever, breaking reboot command and Ctrl-Alt-Del.
-                    // - PCI: https://elixir.bootlin.com/linux/v6.19.8/source/drivers/virtio/virtio_pci_modern.c#L546-L565
-                    // - MMIO: https://elixir.bootlin.com/linux/v6.19.8/source/drivers/virtio/virtio_mmio.c#L251-L258
-                    //
-                    // Since device_status was already set to INIT by set_device_status(), we don't
-                    // need to set it again here.  However, the backend device is still active since
-                    // reset() is unimplemented.  The combination of device_activated == true and
-                    // device_status == INIT will cause set_device_status() to block any
-                    // re-initialization attempts.
-                }
+                self.common_config.queue_select = 0;
+                self.common_config.device_feature_select = 0;
+                self.common_config.driver_feature_select = 0;
+
+                self.reset_msix();
+            } else {
+                error!("Attempt to reset device when not implemented in underlying device");
+                // The virtio spec does not specify what to do if reset fails.
+                //
+                // Our MMIO transport sets FAILED in this case, but we must NOT do that for PCI.
+                // During shutdown, the Linux kernel issues a reset to each virtio device.  The
+                // virtio PCI driver then polls device_status until it reads back 0, unlike the
+                // virtio MMIO driver which simply writes 0 and returns.  Setting FAILED would
+                // cause the poll to spin forever, breaking reboot command and Ctrl-Alt-Del.
+                // - PCI: https://elixir.bootlin.com/linux/v6.19.8/source/drivers/virtio/virtio_pci_modern.c#L546-L565
+                // - MMIO: https://elixir.bootlin.com/linux/v6.19.8/source/drivers/virtio/virtio_mmio.c#L251-L258
+                //
+                // Since device_status was already set to INIT by set_device_status(), we don't
+                // need to set it again here.  However, the backend device is still active since
+                // reset() is unimplemented.  The combination of device_activated == true and
+                // device_status == INIT will cause set_device_status() to block any
+                // re-initialization attempts.
             }
         }
         None
@@ -1006,8 +1143,10 @@ mod tests {
     use vm_memory::{ByteValued, Le32};
 
     use super::{PciCapabilityType, VirtioPciDevice};
+    use crate::Vmm;
     use crate::arch::MEM_64BIT_DEVICES_START;
-    use crate::builder::tests::default_vmm;
+    use crate::builder::tests::default_vmm_with_pci;
+    use crate::device_manager::tests::pci_devices;
     use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
     use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
     use crate::devices::virtio::rng::Entropy;
@@ -1024,15 +1163,15 @@ mod tests {
     use crate::pci::msix::MsixCap;
     use crate::pci::{PciCapabilityId, PciClassCode, PciDevice};
     use crate::rate_limiter::RateLimiter;
-    use crate::{Vm, Vmm};
+    use crate::snapshot::Persist;
+    use crate::vstate::resources::ResourceAllocator;
 
     fn create_vmm_with_virtio_pci_device() -> Vmm {
-        let mut vmm = default_vmm();
-        vmm.device_manager.enable_pci(&vmm.vm);
+        let mut vmm = default_vmm_with_pci();
         let entropy = Arc::new(Mutex::new(Entropy::new(RateLimiter::default()).unwrap()));
         let mut event_manager = crate::EventManager::new().unwrap();
         vmm.device_manager
-            .attach_virtio_device(
+            .attach_boot_virtio_device(
                 &vmm.vm,
                 "rng".to_string(),
                 entropy.clone(),
@@ -1045,8 +1184,7 @@ mod tests {
     }
 
     fn get_virtio_device(vmm: &Vmm) -> Arc<Mutex<VirtioPciDevice>> {
-        vmm.device_manager
-            .pci_devices
+        pci_devices(&vmm.device_manager)
             .get_virtio_device(VirtioDeviceType::Rng, "rng")
             .unwrap()
             .clone()
@@ -1670,7 +1808,7 @@ mod tests {
     }
 
     #[test]
-    fn test_failed_reset_blocks_reinitialization() {
+    fn test_reset_and_reinitialization() {
         let mut vmm = create_vmm_with_virtio_pci_device();
         let device = get_virtio_device(&vmm);
         let mut locked = device.lock().unwrap();
@@ -1686,29 +1824,20 @@ mod tests {
         assert!(locked.device_activated.load(Ordering::SeqCst));
 
         // Write 0 to device_status to request a reset.
-        // Entropy's reset() returns None (unimplemented), so the reset fails.
         write_driver_status(&mut locked, 0);
         assert_eq!(read_driver_status(&mut locked), 0);
-        // device_activated stays true because the backend was not actually reset.
-        assert!(locked.device_activated.load(Ordering::SeqCst));
+        // Device should be deactivated after successful reset.
+        assert!(!locked.device_activated.load(Ordering::SeqCst));
 
-        // Attempt to re-initialize should be rejected because device_activated is
-        // still true while driver_status is INIT.
+        // Re-initialization should succeed after a successful reset.
         write_driver_status(&mut locked, ACKNOWLEDGE);
-        assert_eq!(read_driver_status(&mut locked), 0);
-
-        // Save state and restore into a new device -- the combination of
-        // device_activated == true and driver_status == INIT is preserved in the
-        // snapshot, so the blocking behavior survives restore.
-        let saved_state = locked.state();
-        drop(locked);
-
-        let new_entropy = Arc::new(Mutex::new(Entropy::new(RateLimiter::default()).unwrap()));
-        let restored =
-            VirtioPciDevice::new_from_state("rng".to_string(), &vmm.vm, new_entropy, saved_state)
-                .unwrap();
-
-        assert!(restored.device_activated.load(Ordering::SeqCst));
-        assert_eq!(restored.common_config.driver_status, 0);
+        assert_eq!(read_driver_status(&mut locked), ACKNOWLEDGE);
+        write_driver_status(&mut locked, ACKNOWLEDGE | DRIVER);
+        let features = read_device_features(&mut locked);
+        write_driver_features(&mut locked, features);
+        write_driver_status(&mut locked, ACKNOWLEDGE | DRIVER | FEATURES_OK);
+        setup_queues(&mut locked);
+        write_driver_status(&mut locked, ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK);
+        assert!(locked.device_activated.load(Ordering::SeqCst));
     }
 }

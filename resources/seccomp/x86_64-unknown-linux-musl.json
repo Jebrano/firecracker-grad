@@ -242,6 +242,13 @@
                         "op": "eq",
                         "val": 50,
                         "comment": "libc::MAP_FIXED | libc::MAP_ANONYMOUS | libc::MAP_PRIVATE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },
@@ -255,6 +262,13 @@
                         "op": "eq",
                         "val": 1,
                         "comment": "libc::MAP_SHARED"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },
@@ -268,6 +282,13 @@
                         "op": "eq",
                         "val": 34,
                         "comment": "libc::MAP_ANONYMOUS | libc::MAP_PRIVATE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },
@@ -281,6 +302,13 @@
                         "op": "eq",
                         "val": 32769,
                         "comment": "libc::MAP_SHARED | libc::MAP_POPULATE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },
@@ -618,6 +646,19 @@
             },
             {
                 "syscall": "ioctl",
+                "comment": "Needed for unregistering irqfds during device hot-unplug and VM teardown (called from MsixVectorGroup::drop)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1075883638,
+                        "comment": "KVM_IRQFD"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
                 "comment": "Needed for opening tap device during net hotplug",
                 "args": [
                     {
@@ -673,7 +714,16 @@
             },
             {
                 "syscall": "mprotect",
-                "comment": "Used by memory hotplug to protect access to underlying host memory"
+                "comment": "Used by memory hotplug to protect access to underlying host memory",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
             }
         ]
     },
@@ -863,6 +913,13 @@
                         "op": "eq",
                         "val": 34,
                         "comment": "libc::MAP_ANONYMOUS | libc::MAP_PRIVATE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },
@@ -876,6 +933,13 @@
                         "op": "eq",
                         "val": 1,
                         "comment": "libc::MAP_SHARED"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },
@@ -976,6 +1040,18 @@
             },
             {
                 "syscall": "close"
+            },
+            {
+                "syscall": "eventfd2",
+                "comment": "Needed for recreating the MSI-X vector eventfds when a PCI device is reset by the guest (MsixVectorGroup recreated from the vCPU thread)"
+            },
+            {
+                "syscall": "io_uring_enter",
+                "comment": "Needed to drain the async block IO engine's io_uring when the device is reset by the guest (from the vCPU thread)"
+            },
+            {
+                "syscall": "epoll_ctl",
+                "comment": "Needed to remove the vsock muxer's connection and listener epoll listeners when the device is reset by the guest (from the vCPU thread)"
             },
             {
                 "syscall": "fstat",
@@ -1101,6 +1177,13 @@
                         "op": "eq",
                         "val": 1,
                         "comment": "libc::MAP_SHARED"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },

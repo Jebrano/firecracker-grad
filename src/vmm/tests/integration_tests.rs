@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use vmm::builder::build_and_boot_microvm;
 use vmm::devices::virtio::block::CacheType;
-use vmm::persist::{MicrovmState, MicrovmStateError, VmInfo, snapshot_state_sanity_check};
+use vmm::persist::{
+    MicrovmState, MicrovmStateError, VirtioDevicesState, VmInfo, snapshot_state_sanity_check,
+};
 use vmm::resources::VmResources;
 use vmm::rpc_interface::{
     LoadSnapshotError, PrebootApiController, RuntimeApiController, VmmAction, VmmActionError,
@@ -145,7 +147,14 @@ fn test_dirty_bitmap_success() {
     for (vmm, _) in vmms {
         // Let it churn for a while and dirty some pages...
         thread::sleep(Duration::from_millis(100));
-        let bitmap = vmm.lock().unwrap().vm.get_dirty_bitmap().unwrap();
+        let bitmap = vmm
+            .lock()
+            .unwrap()
+            .vm
+            .as_kvm()
+            .unwrap()
+            .get_dirty_bitmap()
+            .unwrap();
         let num_dirty_pages: u32 = bitmap
             .values()
             .map(|bitmap_per_region| {
@@ -258,29 +267,20 @@ fn verify_create_snapshot(
 
     // Verify deserialized data.
     // The default vmm has no devices and one vCPU.
-    assert_eq!(
-        restored_microvm_state
-            .device_states
-            .mmio_state
-            .block_devices
-            .len(),
-        0
-    );
-    assert_eq!(
-        restored_microvm_state
-            .device_states
-            .mmio_state
-            .net_devices
-            .len(),
-        0
-    );
-    assert!(
-        restored_microvm_state
-            .device_states
-            .mmio_state
-            .vsock_device
-            .is_none()
-    );
+    match &restored_microvm_state.device_states.virtio_state {
+        VirtioDevicesState::Mmio(state) => {
+            assert!(!pci_enabled);
+            assert_eq!(state.block_devices.len(), 0);
+            assert_eq!(state.net_devices.len(), 0);
+            assert!(state.vsock_device.is_none());
+        }
+        VirtioDevicesState::Pci(state) => {
+            assert!(pci_enabled);
+            assert_eq!(state.block_devices.len(), 0);
+            assert_eq!(state.net_devices.len(), 0);
+            assert!(state.vsock_device.is_none());
+        }
+    }
     assert_eq!(restored_microvm_state.vcpu_states.len(), 1);
 
     (snapshot_file, memory_file)
@@ -440,6 +440,7 @@ fn test_preboot_load_snap_disallowed_after_boot_resources() {
         iface_id: String::new(),
         host_dev_name: String::new(),
         guest_mac: None,
+        mtu: None,
         rx_rate_limiter: None,
         tx_rate_limiter: None,
     });

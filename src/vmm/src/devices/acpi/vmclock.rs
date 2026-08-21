@@ -12,7 +12,6 @@ use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryError};
 use vm_superio::Trigger;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::Vm;
 use crate::devices::acpi::generated::vmclock_abi::{
     VMCLOCK_COUNTER_INVALID, VMCLOCK_FLAG_NOTIFICATION_PRESENT,
     VMCLOCK_FLAG_VM_GEN_COUNTER_PRESENT, VMCLOCK_MAGIC, VMCLOCK_STATUS_UNKNOWN, vmclock_abi,
@@ -20,7 +19,7 @@ use crate::devices::acpi::generated::vmclock_abi::{
 use crate::devices::legacy::EventFdTrigger;
 use crate::logger::debug;
 use crate::snapshot::Persist;
-use crate::vstate::memory::GuestMemoryMmap;
+use crate::vstate::memory::{GuestMemoryExtension, GuestMemoryMmap};
 use crate::vstate::resources::ResourceAllocator;
 
 // SAFETY: `vmclock_abi` is a POD
@@ -78,12 +77,14 @@ impl VmClock {
     /// Create a new [`VmClock`] device for a newly booted VM
     pub fn new(resource_allocator: &mut ResourceAllocator) -> Result<VmClock, VmClockError> {
         let addr = resource_allocator
-            .allocate_system_memory(
+            .system_memory
+            .allocate(
                 VMCLOCK_SIZE as u64,
                 VMCLOCK_SIZE as u64,
                 AllocPolicy::LastMatch,
             )
-            .map_err(VmClockError::AllocateMemory)?;
+            .map_err(VmClockError::AllocateMemory)?
+            .start();
 
         let gsi = resource_allocator
             .allocate_gsi_legacy(1)
@@ -113,6 +114,7 @@ impl VmClock {
 
     /// Activate [`VmClock`] device
     pub fn activate(&self, mem: &GuestMemoryMmap) -> Result<(), VmClockError> {
+        mem.check_range_plugged(self.guest_address, self.inner.as_slice().len())?;
         mem.write_slice(self.inner.as_slice(), self.guest_address)?;
         Ok(())
     }
@@ -225,7 +227,6 @@ mod tests {
     use vm_memory::{Bytes, GuestAddress};
     use vmm_sys_util::tempfile::TempFile;
 
-    use crate::Vm;
     #[cfg(target_arch = "x86_64")]
     use crate::arch::x86_64::layout;
     use crate::arch::{self, Kvm};

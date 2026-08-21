@@ -116,6 +116,8 @@ The **API endpoint** can be used to:
 - Add a [entropy device](docs/entropy.md) to the microVM.
 - Add a [pmem device](docs/pmem.md) to the microVM.
 - Configure and manage [memory hotplugging](docs/memory-hotplug.md).
+- `[Developer Preview]` [Hot-plug and hot-unplug](docs/device-hotplug.md) virtio
+  PCI devices while the VM is running.
 - Start the microVM using a given kernel image, root file system, and boot
   arguments.
 - [x86_64 only] Stop the microVM.
@@ -132,23 +134,25 @@ The **API endpoint** can be used to:
 
 We test all combinations of:
 
-| Instance                                    | Host OS & Kernel | Guest Rootfs | Guest Kernel |
-| :------------------------------------------ | :--------------- | :----------- | :----------- |
-| m5n.metal (Intel Cascade Lake)              | al2 linux_5.10   | ubuntu 24.04 | linux_5.10   |
-| m6i.metal (Intel Ice Lake)                  | al2023 linux_6.1 |              | linux_6.1    |
-| m7i.metal-24xl (Intel Sapphire Rapids)      |                  |              |              |
-| m7i.metal-48xl (Intel Sapphire Rapids)      |                  |              |              |
-| **m8i.metal-48xl (Intel Granite Rapids)\*** |                  |              |              |
-| **m8i.metal-96xl (Intel Granite Rapids)\*** |                  |              |              |
-| m6a.metal (AMD Milan)                       |                  |              |              |
-| m7a.metal-48xl (AMD Genoa)                  |                  |              |              |
-| m6g.metal (Graviton 2)                      |                  |              |              |
-| m7g.metal (Graviton 3)                      |                  |              |              |
-| m8g.metal-24xl (Graviton 4)                 |                  |              |              |
-| m8g.metal-48xl (Graviton 4)                 |                  |              |              |
+| Instance                                    | Host OS & Kernel  | Guest Rootfs | Guest Kernel |
+| :------------------------------------------ | :---------------- | :----------- | :----------- |
+| m5n.metal (Intel Cascade Lake)              | al2 linux_5.10    | ubuntu 24.04 | linux_5.10   |
+| m6i.metal (Intel Ice Lake)                  | al2023 linux_6.1  |              | linux_6.1    |
+|                                             | al2023 linux_6.18 |              |              |
+| m7i.metal-24xl (Intel Sapphire Rapids)      |                   |              |              |
+| m7i.metal-48xl (Intel Sapphire Rapids)      |                   |              |              |
+| **m8i.metal-48xl (Intel Granite Rapids)\*** |                   |              |              |
+| **m8i.metal-96xl (Intel Granite Rapids)\*** |                   |              |              |
+| m6a.metal (AMD Milan)                       |                   |              |              |
+| m7a.metal-48xl (AMD Genoa)                  |                   |              |              |
+| m6g.metal (Graviton 2)                      |                   |              |              |
+| m7g.metal (Graviton 3)                      |                   |              |              |
+| m8g.metal-24xl (Graviton 4)                 |                   |              |              |
+| m8g.metal-48xl (Graviton 4)                 |                   |              |              |
 
 **\***: We **only** support AWS EC2 8th Gen Intel (\*8i) instances using a 6.1
-host kernel. This is due to poor kernel support for Granite Rapids CPUs on 5.10.
+or 6.18 host kernel. This is due to poor kernel support for Granite Rapids CPUs
+on 5.10.
 
 ## Known issues and Limitations
 
@@ -178,7 +182,7 @@ You can get in touch with the Firecracker community in the following ways:
 
 - Security-related issues, see our [security policy document](SECURITY.md).
 - Chat with us on our
-  [Slack workspace](https://join.slack.com/t/firecracker-microvm/shared_invite/zt-2tc0mfxpc-tU~HYAYSzLDl5XGGJU3YIg)
+  [Slack workspace](https://join.slack.com/t/firecracker-microvm/shared_invite/zt-3v81btcpe-usCf8Qk7k1gUlSAEKKdYMg)
   _Note: most of the maintainers are on a European time zone._
 - Open a GitHub issue in this repository.
 - Email the maintainers at

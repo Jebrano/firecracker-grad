@@ -292,9 +292,7 @@ impl VirtioBlock {
 
         let rate_limiter = config
             .rate_limiter
-            .map(RateLimiterConfig::try_into)
-            .transpose()
-            .map_err(VirtioBlockError::RateLimiter)?
+            .map(RateLimiter::from)
             .unwrap_or_default();
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
@@ -620,30 +618,17 @@ impl VirtioDevice for VirtioBlock {
             .deref()
     }
 
-    fn read_config(&self, offset: u64, data: &mut [u8]) {
-        if let Some(config_space_bytes) = self.config_space.as_slice().get(u64_to_usize(offset)..) {
-            let len = config_space_bytes.len().min(data.len());
-            data[..len].copy_from_slice(&config_space_bytes[..len]);
-        } else {
-            error!("Failed to read config space");
-            self.metrics.cfg_fails.inc();
-        }
+    fn config_as_bytes(&self) -> &[u8] {
+        self.config_space.as_slice()
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
-        let config_space_bytes = self.config_space.as_mut_slice();
-        let start = usize::try_from(offset).ok();
-        let end = start.and_then(|s| s.checked_add(data.len()));
-        let Some(dst) = start
-            .zip(end)
-            .and_then(|(start, end)| config_space_bytes.get_mut(start..end))
-        else {
-            error!("Failed to write config space");
-            self.metrics.cfg_fails.inc();
-            return;
-        };
-
-        dst.copy_from_slice(data);
+        self.metrics.cfg_fails.inc();
+        warn!(
+            "virtio-block: guest driver attempted to write device config (offset={:#x}, len={:#x})",
+            offset,
+            data.len()
+        );
     }
 
     fn activate(
@@ -651,6 +636,8 @@ impl VirtioDevice for VirtioBlock {
         mem: GuestMemoryMmap,
         interrupt: Arc<dyn VirtioInterrupt>,
     ) -> Result<(), ActivateError> {
+        assert!(!self.is_activated());
+
         for q in self.queues.iter_mut() {
             q.initialize(&mem)
                 .map_err(ActivateError::QueueMemoryError)?;
@@ -673,6 +660,19 @@ impl VirtioDevice for VirtioBlock {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    fn deactivate(&mut self) {
+        self.device_state = DeviceState::Inactive;
+    }
+
+    fn _reset(&mut self) -> bool {
+        if let Err(err) = self.disk.file_engine.drain(true) {
+            error!("Failed to reset block IO engine: {:?}", err);
+            return false;
+        }
+        self.is_io_engine_throttled = false;
+        true
     }
 }
 
@@ -815,68 +815,37 @@ mod tests {
     }
 
     #[test]
-    fn test_virtio_read_config() {
+    fn test_config_as_bytes() {
         for engine in [FileEngineType::Sync, FileEngineType::Async] {
             let block = default_block(engine);
 
-            let mut actual_config_space = ConfigSpace::default();
-            block.read_config(0, actual_config_space.as_mut_slice());
-            // This will read the number of sectors.
+            let config = block.config_as_bytes();
             // The block's backing file size is 0x1000, so there are 8 (4096/512) sectors.
-            // The config space is little endian.
             let expected_config_space = ConfigSpace { capacity: 8 };
-            assert_eq!(actual_config_space, expected_config_space);
-
-            // Invalid read.
-            let expected_config_space = ConfigSpace { capacity: 696969 };
-            actual_config_space = expected_config_space;
-            block.read_config(
-                std::mem::size_of::<ConfigSpace>() as u64 + 1,
-                actual_config_space.as_mut_slice(),
-            );
-
-            // Validate read failed (the config space was not updated).
-            assert_eq!(actual_config_space, expected_config_space);
+            assert_eq!(config, expected_config_space.as_slice());
         }
     }
 
     #[test]
-    fn test_virtio_write_config() {
+    fn test_virtio_device_config_space_is_read_only() {
         for engine in [FileEngineType::Sync, FileEngineType::Async] {
             let mut block = default_block(engine);
 
-            let expected_config_space = ConfigSpace { capacity: 696969 };
-            block.write_config(0, expected_config_space.as_slice());
+            // Snapshot the config space before any write attempt.
+            let initial_config = block.config_as_bytes().to_vec();
 
-            let mut actual_config_space = ConfigSpace::default();
-            block.read_config(0, actual_config_space.as_mut_slice());
-            assert_eq!(actual_config_space, expected_config_space);
-
-            // If privileged user writes to `/dev/mem`, in block config space - byte by byte.
-            let expected_config_space = ConfigSpace {
-                capacity: 0x1122334455667788,
-            };
-            let expected_config_space_slice = expected_config_space.as_slice();
-            for (i, b) in expected_config_space_slice.iter().enumerate() {
-                block.write_config(i as u64, &[*b]);
-            }
-            block.read_config(0, actual_config_space.as_mut_slice());
-            assert_eq!(actual_config_space, expected_config_space);
-
-            // Invalid write.
-            let new_config_space = ConfigSpace {
-                capacity: 0xDEADBEEF,
-            };
-            block.write_config(5, new_config_space.as_slice());
-            // Make sure nothing got written.
-            block.read_config(0, actual_config_space.as_mut_slice());
-            assert_eq!(actual_config_space, expected_config_space);
-
-            // Large offset that may cause an overflow.
-            block.write_config(u64::MAX, new_config_space.as_slice());
-            // Make sure nothing got written.
-            block.read_config(0, actual_config_space.as_mut_slice());
-            assert_eq!(actual_config_space, expected_config_space);
+            // A guest write must be rejected: the config space is left unchanged
+            // and the attempt is counted under cfg_fails.
+            let cfg_fails_before = block.metrics.cfg_fails.count();
+            block.write_config(
+                0,
+                ConfigSpace {
+                    capacity: 0x1122334455667788,
+                }
+                .as_slice(),
+            );
+            assert_eq!(block.config_as_bytes(), initial_config);
+            assert_eq!(block.metrics.cfg_fails.count(), cfg_fails_before + 1);
         }
     }
 
@@ -1386,6 +1355,8 @@ mod tests {
 
             // Read at valid address, with an overflowing length.
             {
+                let mut block = default_block(engine);
+
                 // Default mem size is 0x10000
                 let mem = default_mem();
                 let interrupt = default_interrupt();
@@ -1700,7 +1671,7 @@ mod tests {
 
             // Create bandwidth rate limiter that allows only 5120 bytes/s with bucket size of 8
             // bytes.
-            let mut rl = RateLimiter::new(512, 0, 100, 0, 0, 0).unwrap();
+            let mut rl = RateLimiter::new(512, 0, 100, 0, 0, 0);
             // Use up the budget.
             assert!(rl.consume(512, TokenType::Bytes));
 
@@ -1769,7 +1740,7 @@ mod tests {
             let status_addr = GuestAddress(vq.dtable[2].addr.get());
 
             // Create ops rate limiter that allows only 10 ops/s with bucket size of 1 ops.
-            let mut rl = RateLimiter::new(0, 0, 0, 1, 0, 100).unwrap();
+            let mut rl = RateLimiter::new(0, 0, 0, 1, 0, 100);
             // Use up the budget.
             assert!(rl.consume(1, TokenType::Ops));
 

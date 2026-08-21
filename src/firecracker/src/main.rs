@@ -371,6 +371,8 @@ fn main_exec() -> Result<(), MainError> {
     if let Some(metrics_path) = arguments.single_value("metrics-path") {
         let metrics_config = MetricsConfig {
             metrics_path: PathBuf::from(metrics_path),
+            emit_id: false,
+            properties: None,
         };
         init_metrics(metrics_config).map_err(MainError::MetricsInitialization)?;
     }
@@ -616,6 +618,10 @@ enum RunWithoutApiError {
     Shutdown(FcExitCode),
     /// Failed to build MicroVM from Json: {0}
     BuildMicroVMFromJson(BuildFromJsonError),
+    /// Missing vmm seccomp filter
+    MissingSeccompFilter,
+    /// Failed to install vmm seccomp filter: {0}
+    SeccompFilter(vmm::seccomp::InstallationError),
 }
 
 fn run_without_api(
@@ -646,6 +652,14 @@ fn run_without_api(
         metadata_json,
     )
     .map_err(RunWithoutApiError::BuildMicroVMFromJson)?;
+
+    // INVARIANT: seccomp must be applied before entering the event loop.
+    vmm::seccomp::apply_filter(
+        seccomp_filters
+            .get("vmm")
+            .ok_or(RunWithoutApiError::MissingSeccompFilter)?,
+    )
+    .map_err(RunWithoutApiError::SeccompFilter)?;
 
     // Start the metrics.
     firecracker_metrics

@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use vm_memory::GuestAddress;
 
 use super::device::{ConfigSpace, Pmem, PmemError};
-use crate::Vm;
 use crate::devices::virtio::device::{DeviceState, VirtioDeviceType};
 use crate::devices::virtio::persist::{PersistError as VirtioStateError, VirtioDeviceState};
 use crate::devices::virtio::pmem::{PMEM_NUM_QUEUES, PMEM_QUEUE_SIZE};
@@ -16,7 +15,7 @@ use crate::rate_limiter::persist::RateLimiterState;
 use crate::snapshot::Persist;
 use crate::vmm_config::pmem::PmemConfig;
 use crate::vstate::memory::{GuestMemoryMmap, GuestRegionMmap};
-use crate::vstate::vm::VmError;
+use crate::vstate::vm::{KvmVm, VmError};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PmemState {
@@ -29,7 +28,7 @@ pub struct PmemState {
 #[derive(Debug)]
 pub struct PmemConstructorArgs<'a> {
     pub mem: &'a GuestMemoryMmap,
-    pub vm: Arc<Vm>,
+    pub vm: Arc<KvmVm>,
 }
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -39,7 +38,7 @@ pub enum PmemPersistError {
     /// Error creating Pmem devie: {0}
     Pmem(#[from] PmemError),
     /// Error registering memory region: {0}
-    Vm(#[from] VmError),
+    KvmVm(#[from] VmError),
     /// Error restoring rate limiter: {0}
     RateLimiter(std::io::Error),
 }
@@ -85,12 +84,13 @@ impl<'a> Persist<'a> for Pmem {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
-    use crate::arch::Kvm;
     use crate::devices::virtio::device::VirtioDevice;
     use crate::devices::virtio::test_utils::default_mem;
+    use crate::vstate::vm::tests::setup_vm;
 
     #[test]
     fn test_persistence() {
@@ -106,8 +106,7 @@ mod tests {
             ..Default::default()
         };
         let guest_mem = default_mem();
-        let kvm = Kvm::new(vec![]).unwrap();
-        let vm = Arc::new(Vm::new(&kvm).unwrap());
+        let vm = Arc::new(setup_vm());
         let pmem = Pmem::new(vm.clone(), config).unwrap();
 
         // Save the block device.
@@ -138,5 +137,40 @@ mod tests {
         );
         assert!(!restored_pmem.is_activated());
         assert_eq!(restored_pmem.config, pmem_state.config);
+    }
+
+    #[test]
+    fn test_restore_rejects_mismatched_config_space_size() {
+        let dummy_file = TempFile::new().unwrap();
+        dummy_file.as_file().set_len(0x20_0000);
+        let dummy_path = dummy_file.as_path().to_str().unwrap().to_string();
+        let config = PmemConfig {
+            id: "1".into(),
+            path_on_host: dummy_path,
+            root_device: true,
+            read_only: false,
+            ..Default::default()
+        };
+        let guest_mem = default_mem();
+        let vm = Arc::new(setup_vm());
+        let pmem = Pmem::new(vm.clone(), config).unwrap();
+
+        let mut pmem_state = pmem.save();
+        drop(pmem);
+
+        pmem_state.config_space.size += Pmem::ALIGNMENT;
+
+        let err = Pmem::restore(
+            PmemConstructorArgs {
+                mem: &guest_mem,
+                vm: vm.clone(),
+            },
+            &pmem_state,
+        )
+        .unwrap_err();
+        assert_matches!(
+            err,
+            PmemPersistError::Pmem(PmemError::RestoredSizeMismatch(_, _))
+        );
     }
 }

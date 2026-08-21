@@ -1,5 +1,6 @@
 # Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
+# pylint:disable=too-many-lines
 
 """Classes for working with microVMs.
 
@@ -8,8 +9,6 @@ destroy microvms.
 
 - Use the Firecracker Open API spec to populate Microvm API resource URLs.
 """
-
-# pylint:disable=too-many-lines
 
 import json
 import logging
@@ -28,7 +27,7 @@ from pathlib import Path
 from typing import Optional
 
 import psutil
-from tenacity import Retrying, retry, stop_after_attempt, wait_fixed
+from tenacity import Retrying, retry, stop_after_attempt, stop_after_delay, wait_fixed
 
 import host_tools.cargo_build as build_tools
 import host_tools.network as net_tools
@@ -188,6 +187,7 @@ class HugePagesConfig(str, Enum):
     """Enum describing the huge pages configurations supported Firecracker"""
 
     NONE = "None"
+    TRANSPARENT = "Transparent"
     HUGETLBFS_2MB = "2M"
 
 
@@ -253,7 +253,7 @@ class Microvm:
 
         self._screen_pid = None
 
-        self.time_api_requests = global_props.host_linux_version != "6.1"
+        self.time_api_requests = True
         # disable the HTTP API timings as they cause a lot of false positives
         if int(os.environ.get("PYTEST_XDIST_WORKER_COUNT", 1)) > 1:
             self.time_api_requests = False
@@ -275,6 +275,7 @@ class Microvm:
         self.iface = {}
         self.disks = {}
         self.disks_vhost_user = {}
+        self.huge_pages = HugePagesConfig.NONE
         self.vcpus_count = None
         self.mem_size_bytes = None
         self.cpu_template_name = "None"
@@ -299,14 +300,14 @@ class Microvm:
     def __repr__(self):
         return f"<Microvm id={self.id}>"
 
-    def mark_killed(self):
+    def mark_killed(self, timeout=10.0):
         """
         Marks this `Microvm` as killed, meaning test tear down should not try to kill it
 
         raises an exception if the Firecracker process managing this VM is not actually dead
         """
         if self.firecracker_pid is not None:
-            utils.wait_process_termination(self.firecracker_pid)
+            utils.wait_process_termination(self.firecracker_pid, timeout=timeout)
 
         self._killed = True
 
@@ -337,55 +338,62 @@ class Microvm:
             or might_be_dead
         ), self.log_data
 
-        # pylint: disable=bare-except
-        try:
-            if self.firecracker_pid:
-                os.kill(self.firecracker_pid, signal.SIGKILL)
-
-            if self.screen_pid:
-                os.kill(self.screen_pid, signal.SIGKILL)
-        except:
-            if not might_be_dead:
-                msg = (
-                    "Failed to kill Firecracker Process. Did it already die (or did the UFFD handler process die and take it down)?"
-                    if self.uffd_handler
-                    else "Failed to kill Firecracker Process. Did it already die?"
-                )
-
-                self._dump_debug_information(msg)
-
-                raise
+        # Kill Firecracker and the screen wrapper independently so that one
+        # already being dead (ProcessLookupError) doesn't leak the other.
+        for pid_to_kill in (self.firecracker_pid, self.screen_pid):
+            if not pid_to_kill:
+                continue
+            try:
+                os.kill(pid_to_kill, signal.SIGKILL)
+                try:
+                    utils.wait_process_termination(pid_to_kill)
+                except TimeoutError:
+                    utils.dump_proc_state(pid_to_kill)
+                    raise
+            except ProcessLookupError:
+                pass
+            except OSError:
+                if not might_be_dead:
+                    msg = (
+                        "Failed to kill Firecracker Process. Did it already die (or did the UFFD handler process die and take it down)?"
+                        if self.uffd_handler
+                        else "Failed to kill Firecracker Process. Did it already die?"
+                    )
+                    self._dump_debug_information(msg)
+                    raise
 
         # if microvm was spawned then check if it gets killed
         if self._spawned:
-            # Wait until the Firecracker process is actually dead
-            utils.wait_process_termination(self.firecracker_pid)
-
             # The following logic guards us against the case where `firecracker_pid` for some
             # reason is the wrong PID, e.g. this is a regression test for
             # https://github.com/firecracker-microvm/firecracker/pull/4442/commits/d63eb7a65ffaaae0409d15ed55d99ecbd29bc572
+            # Note: we have to retry a bit because /proc might show killed processes for a brief amount of time.
+            for attempt in Retrying(
+                wait=wait_fixed(0.1), stop=stop_after_delay(1.0), reraise=True
+            ):
+                with attempt:
+                    # filter ps results for the jailer's unique id
+                    _, stdout, _ = utils.check_output(
+                        "ps ax --no-headers -o pid,cmd -ww"
+                    )
 
-            # filter ps results for the jailer's unique id
-            _, stdout, stderr = utils.run_cmd(
-                f"ps ax -o pid,cmd -ww | grep {self.jailer.jailer_id}"
-            )
+                    offenders = []
+                    for proc in stdout.splitlines():
+                        _, cmd = proc.lower().split(maxsplit=1)
+                        if self.jailer.jailer_id in cmd and "firecracker" in cmd:
+                            offenders.append(proc)
 
-            assert not stderr, f"error querying processes using `ps`: {stderr}"
-
-            offenders = []
-            for proc in stdout.splitlines():
-                _, cmd = proc.lower().split(maxsplit=1)
-                if "firecracker" in proc and not cmd.startswith("screen"):
-                    offenders.append(proc)
-
-            # make sure firecracker was killed
-            assert not offenders, (
-                f"Firecracker reported its pid {self.firecracker_pid}, which was killed, but there still exist processes using the supposedly dead Firecracker's jailer_id: \n"
-                + "\n".join(offenders)
-            )
+                    # make sure firecracker was killed
+                    assert not offenders, (
+                        f"Firecracker reported its pid {self.firecracker_pid}, which was killed, but there still exist processes using the supposedly dead Firecracker's jailer_id: \n"
+                        + "\n".join(offenders)
+                    )
 
         if self.uffd_handler and self.uffd_handler.is_running():
             self.uffd_handler.kill()
+
+        if self.api:
+            self.api.session.close()
 
         # Mark the microVM as not spawned, so we avoid trying to kill twice.
         self._spawned = False
@@ -810,7 +818,7 @@ class Microvm:
         boot_args: str = None,
         use_initrd: bool = False,
         track_dirty_pages: bool = False,
-        huge_pages: HugePagesConfig = None,
+        huge_pages: HugePagesConfig = HugePagesConfig.NONE,
         rootfs_io_engine=None,
         cpu_template: Optional[str] = None,
         enable_entropy_device=False,
@@ -838,6 +846,7 @@ class Microvm:
             track_dirty_pages=track_dirty_pages,
             huge_pages=huge_pages,
         )
+        self.huge_pages = huge_pages
         self.vcpus_count = vcpu_count
         self.mem_size_bytes = mem_size_mib * 2**20
 
@@ -853,7 +862,7 @@ class Microvm:
         if boot_args is not None:
             self.boot_args = boot_args
         else:
-            self.boot_args = "reboot=k panic=1 nomodule swiotlb=noforce console=ttyS0"
+            self.boot_args = "reboot=k panic=1 nomodule swiotlb=noforce console=ttyS0 cryptomgr.notests"
             if not self.pci_enabled:
                 self.boot_args += " pci=off"
         boot_source_args = {
@@ -1330,6 +1339,30 @@ class MicroVMFactory:
         )
         return vm
 
+    def build_booted(self, kernel, rootfs, *, pci=False, **basic_config_kwargs):
+        """Build, spawn, basic_config, add a default net iface, start.
+
+        Extra keyword arguments are forwarded to `Microvm.basic_config`.
+        """
+        vm = self.build(kernel, rootfs, pci=pci)
+        vm.spawn()
+        vm.basic_config(**basic_config_kwargs)
+        vm.add_net_iface()
+        vm.start()
+        return vm
+
+    def build_restored(self, kernel, rootfs, *, pci=False, **basic_config_kwargs):
+        """build_booted, then snapshot + kill + restore.
+
+        Extra keyword arguments are forwarded to `Microvm.basic_config`.
+        """
+        booted = self.build_booted(kernel, rootfs, pci=pci, **basic_config_kwargs)
+        snapshot = booted.snapshot_full()
+        booted.kill()
+        restored = self.build_from_snapshot(snapshot)
+        restored.cpu_template_name = booted.cpu_template_name
+        return restored
+
     def build_n_from_snapshot(
         self,
         current_snapshot,
@@ -1462,3 +1495,23 @@ class Serial:
                 assert False
 
         return rx_str
+
+    def drain_until_idle(self, idle_seconds=1):
+        """Read and discard serial output until the console is idle.
+
+        Returns once no new output has arrived for idle_seconds.
+        Used after snapshot restore to let kernel messages (e.g. crng reseeded)
+        finish before sending input, avoiding the input being swallowed while
+        the kernel holds the console lock.
+        """
+        last_activity = time.time()
+        start = time.time()
+        while True:
+            now = time.time()
+            if (now - start) >= self.RX_TIMEOUT_S:
+                break
+            ch = self.rx_char()
+            if ch:
+                last_activity = now
+            elif now - last_activity >= idle_seconds:
+                break
