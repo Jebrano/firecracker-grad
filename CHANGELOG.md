@@ -30,8 +30,18 @@ and this project adheres to
   support for booting `bzImage` guest kernels on x86_64, in addition to the
   existing uncompressed ELF (`vmlinux`) images. The kernel image format is
   detected automatically, so no configuration change is required.
+- [#6064](https://github.com/firecracker-microvm/firecracker/pull/6064): Added
+  the `huge_pages` field to `PUT /snapshot/load`, allowing the restored microVM
+  to reuse the snapshot's host page configuration or select `None`,
+  `Transparent`, or `2M`.
 
 ### Changed
+
+- [#6115](https://github.com/firecracker-microvm/firecracker/pull/6115): Changed
+  the T2S CPU template to set the `FB_CLEAR` bit of `MSR_IA32_ARCH_CAPABILITIES`
+  to 1. This lets guest kernels recognize that the `VERW` instruction clears
+  fill buffers, including on host kernels before v6.4 that cannot expose
+  `FLUSH_L1D`.
 
 ### Deprecated
 
@@ -77,6 +87,15 @@ and this project adheres to
   interrupted thread already held the logger lock would re-acquire it and hang
   the VMM. The logger now uses an `RwLock` so logging takes a shared lock that a
   nested (signal-handler) log can re-acquire without blocking.
+- [#6120](https://github.com/firecracker-microvm/firecracker/pull/6120): Fixed a
+  bug caused by a KVM behavior change introduced in Linux 6.13, which requires
+  guest CPUID to be set before userspace reads CPUID-dependent MSRs. On x86_64
+  with Linux 6.18 host kernels, Firecracker read the base values of those MSRs
+  before setting guest CPUID, so KVM returned zero for such MSRs and CPU
+  templates consequently used zero for bits configured for passthrough.
+  Firecracker now sets guest CPUID before reading MSRs to be modified by CPU
+  templates, so passthrough bits retain their KVM-provided values and features
+  such as eIBRS remain exposed to the guest.
 
 ## [1.16.1]
 
